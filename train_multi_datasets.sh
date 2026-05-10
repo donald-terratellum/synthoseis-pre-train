@@ -461,10 +461,10 @@ echo ""
 # Ensure checkpoint/output directory exists before launching training.
 mkdir -p "${OUTPUT_DIR}"
 
-# Train — train.py re-scans DATA_FOLDER at the start of each epoch and
-# incorporates new datasets automatically.  The set-difference split logic
-# guarantees that no dataset ever appears in both train and val.
-uv run python -u train.py \
+# Train — run the local train.py explicitly so forwarded args match local parser.
+# train.py re-scans DATA_FOLDER at the start of each epoch and incorporates new datasets.
+# Using an explicit path avoids accidentally invoking a different installed script.
+python -u ./train.py \
     --data_folder "${DATA_FOLDER}" \
     --batch_size "${BATCH_SIZE}" \
     --epochs "${MAX_EPOCHS}" \
