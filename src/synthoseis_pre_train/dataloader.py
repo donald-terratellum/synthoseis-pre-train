@@ -24,7 +24,9 @@ class SeismicDataset:
         self,
         data_path: str,
         sample_shape: Tuple[int, int, int] = (128, 128, 128),
-        trace_mask_ratio: float = 0.07,
+        target_masked_fraction: Optional[float] = None,
+        cluster_shape: int = 3,
+        center_selection_method: str = "random_mixture",
         augment: bool = True,
         normalize: bool = True,
         target_std: float = 1.0,
@@ -37,6 +39,10 @@ class SeismicDataset:
             data_path: Path to Zarr seismic data
             sample_shape: Shape of each training sample (x, y, z)
             trace_mask_ratio: Ratio of traces to mask
+            target_masked_fraction: Target final masked fraction after accounting
+                for cluster size and in-cluster probability
+            cluster_shape: Odd cluster edge size (e.g. 3, 5, 7)
+            center_selection_method: Center sampling method passed to masking
             augment: Whether to apply data augmentation
             normalize: Whether to normalize samples
             target_std: Target standard deviation after normalization
@@ -46,7 +52,9 @@ class SeismicDataset:
         """
         self.data_path = Path(data_path)
         self.sample_shape = sample_shape
-        self.trace_mask_ratio = trace_mask_ratio
+        self.target_masked_fraction = target_masked_fraction
+        self.cluster_shape = cluster_shape
+        self.center_selection_method = center_selection_method
         self.augment = augment
         self.normalize = normalize
         self.target_std = target_std
@@ -181,7 +189,12 @@ class SeismicDataset:
         # Peak/trough preservation + trace masking — applied to input (x) only.
         # create_mask_3d receives and returns (z, x, y) — no transpose needed.
         from synthoseis_pre_train.masking import create_mask_3d, apply_mask_to_seismic
-        trace_mask = create_mask_3d(input_data, trace_mask_ratio=self.trace_mask_ratio)
+        trace_mask = create_mask_3d(
+            input_data,
+            target_masked_fraction=self.target_masked_fraction,
+            cluster_shape=self.cluster_shape,
+            center_selection_method=self.center_selection_method,
+        )
         input_data, _, trace_mask = apply_mask_to_seismic(input_data, trace_mask)
 
         # Combine with geometric mask: exclude squeeze/t2d edge artifacts from loss.

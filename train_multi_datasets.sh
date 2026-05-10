@@ -49,6 +49,7 @@ THERMAL_COOLDOWN_SEC=${THERMAL_COOLDOWN_SEC:-300}
 THERMAL_CHECK_EVERY_BATCHES=${THERMAL_CHECK_EVERY_BATCHES:-10}
 THERMAL_PRESSURE_TRIP_LEVEL=${THERMAL_PRESSURE_TRIP_LEVEL:-serious}
 LR_SCHEDULE=${LR_SCHEDULE:-poly}
+LR=${LR:-1e-4}
 LR_POLY_POWER=${LR_POLY_POWER:-0.9}
 LR_MIN=${LR_MIN:-1e-6}
 LR_WARMUP_EPOCHS=${LR_WARMUP_EPOCHS:-5}
@@ -57,7 +58,26 @@ GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-1.0}
 EMA_DECAY=${EMA_DECAY:-0.999}
 EMA_UPDATE_EVERY=${EMA_UPDATE_EVERY:-1}
+OUTPUT_DIR=${OUTPUT_DIR:-"checkpoints"}
+TARGET_MASKED_FRACTION=${TARGET_MASKED_FRACTION:-0.15}
+CLUSTER_SHAPE=${CLUSTER_SHAPE:-3}
+CENTER_SELECTION_METHOD=${CENTER_SELECTION_METHOD:-random_mixture}
+LOSS_TYPE=${LOSS_TYPE:-huber}
+HUBER_DELTA=${HUBER_DELTA:-0.1}
+SSIM_WINDOW_SIZE=${SSIM_WINDOW_SIZE:-16}
+SSIM_SIGMA=${SSIM_SIGMA:-2.6666667}
+SSIM_DATA_RANGE=${SSIM_DATA_RANGE:-30.0}
+SSIM_ALPHA=${SSIM_ALPHA:-0.1666667}
+SSIM_MIN_VALID_RATIO=${SSIM_MIN_VALID_RATIO:-0.5}
+ENABLE_CLUSTER_LOSS=${ENABLE_CLUSTER_LOSS:-false}
+CLUSTER_KERNEL_SIZE=${CLUSTER_KERNEL_SIZE:-5}
+CLUSTER_EPS=${CLUSTER_EPS:-1e-6}
+CLUSTER_BASE_WEIGHT=${CLUSTER_BASE_WEIGHT:-0.3333333}
+CLUSTER_CLUSTER_WEIGHT=${CLUSTER_CLUSTER_WEIGHT:-0.6666667}
 RESUME=${RESUME:-""}
+MONITOR_DISABLED=${MONITOR_DISABLED:-false}
+MONITOR_INTERVAL_SEC=${MONITOR_INTERVAL_SEC:-300}
+MONITOR_CSV_PATH=${MONITOR_CSV_PATH:-""}
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -118,6 +138,10 @@ while [[ $# -gt 0 ]]; do
       LR_SCHEDULE="$2"
       shift 2
       ;;
+    --lr)
+      LR="$2"
+      shift 2
+      ;;
     --lr-poly-power)
       LR_POLY_POWER="$2"
       shift 2
@@ -150,12 +174,89 @@ while [[ $# -gt 0 ]]; do
       EMA_UPDATE_EVERY="$2"
       shift 2
       ;;
+    --output-dir)
+      OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    
+    --target-masked-fraction)
+      TARGET_MASKED_FRACTION="$2"
+      shift 2
+      ;;
+    --cluster-shape)
+      CLUSTER_SHAPE="$2"
+      shift 2
+      ;;
+    --center-selection-method)
+      CENTER_SELECTION_METHOD="$2"
+      shift 2
+      ;;
+    --loss-type)
+      LOSS_TYPE="$2"
+      shift 2
+      ;;
+    --huber-delta)
+      HUBER_DELTA="$2"
+      shift 2
+      ;;
+    --ssim-window-size)
+      SSIM_WINDOW_SIZE="$2"
+      shift 2
+      ;;
+    --ssim-sigma)
+      SSIM_SIGMA="$2"
+      shift 2
+      ;;
+    --ssim-data-range)
+      SSIM_DATA_RANGE="$2"
+      shift 2
+      ;;
+    --ssim-alpha)
+      SSIM_ALPHA="$2"
+      shift 2
+      ;;
+    --ssim-min-valid-ratio)
+      SSIM_MIN_VALID_RATIO="$2"
+      shift 2
+      ;;
+    --enable-cluster-loss)
+      ENABLE_CLUSTER_LOSS="true"
+      shift
+      ;;
+    --cluster-kernel-size)
+      CLUSTER_KERNEL_SIZE="$2"
+      shift 2
+      ;;
+    --cluster-eps)
+      CLUSTER_EPS="$2"
+      shift 2
+      ;;
+    --cluster-base-weight)
+      CLUSTER_BASE_WEIGHT="$2"
+      shift 2
+      ;;
+    --cluster-cluster-weight)
+      CLUSTER_CLUSTER_WEIGHT="$2"
+      shift 2
+      ;;
     --overnight)
       # Already handled above; consume the flag so it isn't treated as unknown.
       shift
       ;;
     --resume)
       RESUME="$2"
+      shift 2
+      ;;
+    --no-monitor)
+      MONITOR_DISABLED=true
+      shift
+      ;;
+    --monitor-interval-sec)
+      MONITOR_INTERVAL_SEC="$2"
+      shift 2
+      ;;
+    --monitor-csv-path)
+      MONITOR_CSV_PATH="$2"
       shift 2
       ;;
     --help)
@@ -187,6 +288,7 @@ while [[ $# -gt 0 ]]; do
       echo "                       Pause for thermal pressure at/above this level:"
       echo "                       off|nominal|fair|serious|critical (default: serious)"
       echo "  --lr-schedule MODE   LR schedule: poly|cosine|constant (default: poly)"
+      echo "  --lr NUM            Base learning rate (default: 1e-4)"
       echo "  --lr-poly-power NUM  Polynomial power for poly LR schedule (default: 0.9)"
       echo "  --lr-min NUM         Minimum LR floor for poly/cosine (default: 1e-6)"
       echo "  --lr-warmup-epochs N Warmup epochs before LR decay (default: 5)"
@@ -196,11 +298,43 @@ while [[ $# -gt 0 ]]; do
       echo "  --grad-clip-norm NUM Global gradient clipping max-norm (default: 1.0; <=0 disables)"
       echo "  --ema-decay NUM      EMA decay (default: 0.999; <=0 disables)"
       echo "  --ema-update-every N EMA update cadence in optimizer steps (default: 1)"
+      echo "  --output-dir PATH    Checkpoint/output directory (default: checkpoints)"
+  
+      echo "  --target-masked-fraction NUM"
+      echo "                       Target final masked fraction in [0,1] after cluster effects"
+      echo "                       (default: 0.15)"
+      echo "  --cluster-shape N    Odd cluster edge size (e.g. 3, 5, 7) (default: 3)"
+      echo "  --center-selection-method METHOD"
+      echo "                       random_mixture|mitchell_best_candidate|poisson_disc|uniform_random"
+      echo "                       (default: random_mixture)"
+      echo "  --loss-type TYPE     Loss function: mse|huber|ssim_mse (default: huber)"
+      echo "  --huber-delta NUM    Delta parameter for Huber loss (default: 0.1)"
+      echo "  --ssim-window-size N 3D SSIM Gaussian window size (default: 16)"
+      echo "  --ssim-sigma NUM     3D SSIM Gaussian sigma (default: 2.6666667)"
+      echo "  --ssim-data-range NUM"
+      echo "                       Data range used by SSIM constants (default: 30.0)"
+      echo "  --ssim-alpha NUM     Blend factor in [0,1] for SSIM+MSE; 0=MSE, 1=SSIM"
+      echo "                       (default: 0.1666667, matching prior 0.2 weight ratio)"
+      echo "  --ssim-min-valid-ratio NUM"
+      echo "                       Minimum local valid support ratio in [0,1] (default: 0.5)"
+      echo "  --enable-cluster-loss  Enable composite cluster-aware loss that upweights traces near masked clusters"
+      echo "  --cluster-kernel-size N" \
+      echo "                       Kernel size for 2D uniform filter applied to trace mask (odd int, default: 5)"
+      echo "  --cluster-eps NUM      Epsilon threshold for smoothed cluster mask (default: 1e-6)"
+      echo "  --cluster-base-weight NUM"
+      echo "                       Weight for base loss in composite (default: 1/3)"
+      echo "  --cluster-cluster-weight NUM"
+      echo "                       Weight for cluster loss in composite (default: 2/3)"
       echo "  --overnight           Enable overnight/unattended mode: applies safer thermal defaults"
       echo "                       (max-c 80, cooldown 420s, check every 5 batches, pressure=fair)"
       echo "                       and stability-first optimizer settings. Individual flags override."
-      echo "  --resume PATH         Resume from checkpoint file (e.g. checkpoints/partial_latest.pt)"
-      echo "  --help                Show this help message"
+        echo "  --resume PATH         Resume from checkpoint file (e.g. checkpoints/partial_latest.pt)"
+        echo "  --no-monitor          Disable background process-tree resource CSV monitor (enabled by default)"
+        echo "  --monitor-interval-sec NUM"
+        echo "                       Monitor sampling interval in seconds (default: 300)"
+        echo "  --monitor-csv-path PATH"
+        echo "                       CSV path for monitor rows (default: cpu_mem_stats_<pid>.csv)"
+        echo "  --help                Show this help message"
       exit 0
       ;;
     *)
@@ -210,6 +344,66 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+case "${LOSS_TYPE}" in
+  mse|huber|ssim_mse)
+    ;;
+  *)
+    echo "ERROR: --loss-type must be one of 'mse', 'huber', 'ssim_mse' (got: ${LOSS_TYPE})"
+    exit 1
+    ;;
+esac
+
+if ! awk "BEGIN { exit !(${HUBER_DELTA} > 0) }"; then
+  echo "ERROR: --huber-delta must be > 0 (got: ${HUBER_DELTA})"
+  exit 1
+fi
+
+if ! awk "BEGIN { exit !(${SSIM_WINDOW_SIZE} >= 3 && int(${SSIM_WINDOW_SIZE}) == ${SSIM_WINDOW_SIZE}) }"; then
+  echo "ERROR: --ssim-window-size must be an integer >= 3 (got: ${SSIM_WINDOW_SIZE})"
+  exit 1
+fi
+
+if ! awk "BEGIN { exit !(${SSIM_SIGMA} > 0) }"; then
+  echo "ERROR: --ssim-sigma must be > 0 (got: ${SSIM_SIGMA})"
+  exit 1
+fi
+
+if ! awk "BEGIN { exit !(${SSIM_DATA_RANGE} > 0) }"; then
+  echo "ERROR: --ssim-data-range must be > 0 (got: ${SSIM_DATA_RANGE})"
+  exit 1
+fi
+
+if ! awk "BEGIN { exit !(${SSIM_ALPHA} >= 0 && ${SSIM_ALPHA} <= 1) }"; then
+  echo "ERROR: --ssim-alpha must be between 0 and 1 (got: ${SSIM_ALPHA})"
+  exit 1
+fi
+
+if ! awk "BEGIN { exit !(${SSIM_MIN_VALID_RATIO} >= 0 && ${SSIM_MIN_VALID_RATIO} <= 1) }"; then
+  echo "ERROR: --ssim-min-valid-ratio must be between 0 and 1 (got: ${SSIM_MIN_VALID_RATIO})"
+  exit 1
+fi
+
+
+
+if ! awk "BEGIN { exit !(${TARGET_MASKED_FRACTION} >= 0 && ${TARGET_MASKED_FRACTION} <= 1) }"; then
+  echo "ERROR: --target-masked-fraction must be between 0 and 1 (got: ${TARGET_MASKED_FRACTION})"
+  exit 1
+fi
+
+if ! awk "BEGIN { exit !(${CLUSTER_SHAPE} >= 1 && int(${CLUSTER_SHAPE}) == ${CLUSTER_SHAPE} && int(${CLUSTER_SHAPE}) % 2 == 1) }"; then
+  echo "ERROR: --cluster-shape must be a positive odd integer (got: ${CLUSTER_SHAPE})"
+  exit 1
+fi
+
+case "${CENTER_SELECTION_METHOD}" in
+  random_mixture|mitchell_best_candidate|poisson_disc|uniform_random)
+    ;;
+  *)
+    echo "ERROR: --center-selection-method must be one of random_mixture|mitchell_best_candidate|poisson_disc|uniform_random (got: ${CENTER_SELECTION_METHOD})"
+    exit 1
+    ;;
+esac
 
 [[ "${OVERNIGHT}" == "true" ]] && echo "*** Overnight mode active — safer thermal and stability defaults applied ***"
 echo "=== Multi-dataset Seismic Training ==="
@@ -228,6 +422,7 @@ echo "Thermal cooldown:   ${THERMAL_COOLDOWN_SEC}s"
 echo "Thermal check rate: every ${THERMAL_CHECK_EVERY_BATCHES} batches"
 echo "Thermal pressure trip level: ${THERMAL_PRESSURE_TRIP_LEVEL}"
 echo "LR schedule:        ${LR_SCHEDULE}"
+echo "LR base:            ${LR}"
 echo "LR poly power:      ${LR_POLY_POWER}"
 echo "LR min:             ${LR_MIN}"
 echo "LR warmup:          ${LR_WARMUP_EPOCHS} epoch(s), start factor ${LR_WARMUP_START_FACTOR}"
@@ -235,7 +430,24 @@ echo "Grad accumulation:  ${GRAD_ACCUM_STEPS}"
 echo "Grad clip norm:     ${GRAD_CLIP_NORM}"
 echo "EMA decay:          ${EMA_DECAY}"
 echo "EMA update every:   ${EMA_UPDATE_EVERY} step(s)"
+echo "Checkpoint folder:  ${OUTPUT_DIR}"
+echo "Mask target:        ${TARGET_MASKED_FRACTION}"
+echo "Cluster shape:      ${CLUSTER_SHAPE}"
+echo "Center method:      ${CENTER_SELECTION_METHOD}"
+if [[ "${LOSS_TYPE}" == "huber" ]]; then
+  echo "Loss function:      ${LOSS_TYPE} (delta=${HUBER_DELTA})"
+elif [[ "${LOSS_TYPE}" == "ssim_mse" ]]; then
+  echo "Loss function:      ${LOSS_TYPE} (window=${SSIM_WINDOW_SIZE}, sigma=${SSIM_SIGMA}, range=${SSIM_DATA_RANGE}, alpha=${SSIM_ALPHA}, min_valid_ratio=${SSIM_MIN_VALID_RATIO})"
+else
+  echo "Loss function:      ${LOSS_TYPE}"
+fi
+if [[ "${ENABLE_CLUSTER_LOSS}" == "true" ]]; then
+  echo "Cluster loss:       enabled (kernel=${CLUSTER_KERNEL_SIZE}, eps=${CLUSTER_EPS}, base_weight=${CLUSTER_BASE_WEIGHT}, cluster_weight=${CLUSTER_CLUSTER_WEIGHT})"
+else
+  echo "Cluster loss:       disabled"
+fi
 [[ -n "${RESUME}" ]] && echo "Resume from: ${RESUME}"
+echo "Monitor enabled:    $([[ "${MONITOR_DISABLED}" == true ]] && echo no || echo yes) (interval=${MONITOR_INTERVAL_SEC}s)"
 echo ""
 
 # Calculate batch size if set to auto
@@ -265,6 +477,9 @@ fi
 echo "Found ${INITIAL_COUNT} dataset folder(s) in ${DATA_FOLDER} at startup"
 echo ""
 
+# Ensure checkpoint/output directory exists before launching training.
+mkdir -p "${OUTPUT_DIR}"
+
 # Train — train.py re-scans DATA_FOLDER at the start of each epoch and
 # incorporates new datasets automatically.  The set-difference split logic
 # guarantees that no dataset ever appears in both train and val.
@@ -274,7 +489,10 @@ uv run python -u train.py \
     --epochs "${MAX_EPOCHS}" \
     --sample_shape ${SAMPLE_SHAPE} \
     --device "${DEVICE}" \
-    --output_dir "checkpoints" \
+    --output_dir "${OUTPUT_DIR}" \
+    --target_masked_fraction "${TARGET_MASKED_FRACTION}" \
+    --cluster_shape "${CLUSTER_SHAPE}" \
+    --center_selection_method "${CENTER_SELECTION_METHOD}" \
     --train_batches_per_epoch "${TRAIN_BATCHES_PER_EPOCH}" \
     --val_batches_per_epoch "${VAL_BATCHES_PER_EPOCH}" \
     --refresh_every_batches "${REFRESH_EVERY_BATCHES}" \
@@ -283,6 +501,7 @@ uv run python -u train.py \
     --thermal_cooldown_sec "${THERMAL_COOLDOWN_SEC}" \
     --thermal_check_every_batches "${THERMAL_CHECK_EVERY_BATCHES}" \
     --thermal_pressure_trip_level "${THERMAL_PRESSURE_TRIP_LEVEL}" \
+    --lr "${LR}" \
     --lr_schedule "${LR_SCHEDULE}" \
     --lr_poly_power "${LR_POLY_POWER}" \
     --lr_min "${LR_MIN}" \
@@ -292,6 +511,21 @@ uv run python -u train.py \
     --grad_clip_norm "${GRAD_CLIP_NORM}" \
     --ema_decay "${EMA_DECAY}" \
     --ema_update_every "${EMA_UPDATE_EVERY}" \
+    --loss_type "${LOSS_TYPE}" \
+    --huber_delta "${HUBER_DELTA}" \
+    --ssim_window_size "${SSIM_WINDOW_SIZE}" \
+    --ssim_sigma "${SSIM_SIGMA}" \
+    --ssim_data_range "${SSIM_DATA_RANGE}" \
+    --ssim_alpha "${SSIM_ALPHA}" \
+    --ssim_min_valid_ratio "${SSIM_MIN_VALID_RATIO}" \
+    --monitor_interval_sec "${MONITOR_INTERVAL_SEC}" \
+    $([[ "${ENABLE_CLUSTER_LOSS}" == "true" ]] && echo --enable-cluster-loss) \
+    --cluster-kernel-size "${CLUSTER_KERNEL_SIZE}" \
+    --cluster-eps "${CLUSTER_EPS}" \
+    --cluster-base-weight "${CLUSTER_BASE_WEIGHT}" \
+    --cluster-cluster-weight "${CLUSTER_CLUSTER_WEIGHT}" \
+    $([[ "${MONITOR_DISABLED}" == true ]] && echo --no_monitor) \
+    ${MONITOR_CSV_PATH:+--monitor_csv_path "${MONITOR_CSV_PATH}"} \
     ${RESUME:+--resume "${RESUME}"}
 
 echo "=== Multi-dataset training complete ==="

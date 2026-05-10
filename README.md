@@ -58,6 +58,28 @@ uv run python tests/test_gpu_resources.py
 uv run python inference.py --sample_shape 128 128 128 --batch_size 1 --device auto
 ```
 
+Post-`uv sync` note (macOS / Apple Silicon)
+----------------------------------------
+
+`uv sync` recreates the project venv and may not include platform-specific
+packaging (for example the `pip` binary can be bootstrapped by `uv`). For
+installing PyTorch on macOS arm64 (MPS/Metal) run the helper script below or
+manually bootstrap pip and then install the metal wheels index.
+
+Manual commands:
+
+```bash
+# bootstrap pip if needed
+uv run python -m ensurepip --upgrade
+uv run python -m pip install -U pip setuptools wheel
+
+# install PyTorch (Apple Silicon / metal wheels)
+uv run python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/metal.html
+```
+
+Helper script: `scripts/bootstrap_pytorch.sh` (see repository)
+
+
 ## One-epoch GPU smoke test
 
 A quick smoke test is available via the root wrapper script:

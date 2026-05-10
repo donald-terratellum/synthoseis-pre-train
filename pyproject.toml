@@ -12,14 +12,26 @@ dependencies = [
     "numpy>=1.21.0",
     "scipy>=1.8.0",
     "zarr>=2.12.0",
-    "torch>=2.0.0",
     "matplotlib>=3.7.0",
     "tensorboard>=2.14.0",
     "pytest>=7.0.0",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "torchaudio>=2.0.0",
 ]
 
 [project.optional-dependencies]
+# Dev extras: testing, formatting, and packaging tooling.
 dev = [
     "pytest>=7.0.0",
     "black>=22.0.0",
+    "pip",
+    "wheel",
 ]
+
+# Optional torch dependencies are provided as an extra to avoid forcing a
+# platform-specific heavy install during a simple `uv sync`.
+# Note: torch and related packages are included in `dependencies` so that
+# `uv sync` installs them automatically on environment creation. Platform-
+# specific wheels (e.g. metal) may still require using `uv pip` or the
+# project's bootstrap helper script for Apple Silicon.

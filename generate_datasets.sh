@@ -14,8 +14,12 @@
 #   --synthoseis-dir PATH     Directory containing the synthoseis main.py (default: .)
 #   -d, --synthoseis-zarr-folder PATH Folder where seismic zarr datasets live
 #                                 (default: /Users/donaldpg/synthoseis/fake_data)
-#   --check-log FILE              Training log file to interrogate for the
-#                                 currently-active dataset (last 25 lines scanned)
+#   --check-log FILE              Training log file to read epoch elapsed time
+#                                 for generation pacing
+#   --min-free-gb N               Minimum free disk space (GB) required before
+#                                 starting a synthoseis run (default: 50)
+#   --disk-recheck-sec N          Seconds to sleep before rechecking disk space
+#                                 when below threshold (default: 3600)
 #   --start-index N               First run index (d4, default: 1; auto-detected from
 #                                 existing _synthoseis_run_NNNN dirs if not set)
 #   --no-replace                  Append-only mode (default): never delete datasets
@@ -39,6 +43,9 @@ ZARR_FOLDER="/Users/donaldpg/synthoseis/fake_data"
 CHECK_LOG=""
 START_INDEX=""   # auto-detect if empty
 NO_REPLACE=true
+TARGET_NEW_PER_EPOCH=2
+MIN_FREE_GB=50
+RECHECK_SLEEP_SEC=3600
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -48,6 +55,8 @@ while [[ $# -gt 0 ]]; do
         --synthoseis-dir)       SYNTHOSEIS_DIR="$2";         shift 2 ;;
         -d|--synthoseis-zarr-folder) ZARR_FOLDER="$2";      shift 2 ;;
         --check-log)            CHECK_LOG="$2";              shift 2 ;;
+        --min-free-gb)          MIN_FREE_GB="$2";            shift 2 ;;
+        --disk-recheck-sec)     RECHECK_SLEEP_SEC="$2";      shift 2 ;;
         --start-index)          START_INDEX="$2";            shift 2 ;;
         --no-replace)           NO_REPLACE=true;              shift ;;
         --replace-oldest)       NO_REPLACE=false;             shift ;;
@@ -59,23 +68,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
-# Return the dataset name (basename without path) currently being trained on,
-# by scanning the last 25 lines of the training log.
-# Looks for lines like: "Dataset seismic__2026.*__300ph..." 
-active_dataset_from_log() {
-    local log_file="$1"
-    if [[ -z "$log_file" || ! -f "$log_file" ]]; then
-        echo ""
-        return
-    fi
-    # Grab the last "Dataset ..." line and extract the dataset directory name.
-    # Training prints:  Dataset seismic__2026.XXXXXXXX__XXX, <array_keys> [N/M]
-    tail -n 25 "$log_file" \
-        | grep -oE 'Dataset seismic__[^, ]+' \
-        | sed 's/^Dataset //' \
-        | tail -n 1 || true
-}
 
 # List all seismic__* directories in ZARR_FOLDER sorted by modification time
 # (oldest first).  Prints just the basename.
@@ -124,6 +116,44 @@ fmt_duration() {
     fi
 }
 
+# Return free space in KiB for the filesystem containing the given path.
+get_free_kib() {
+    local path="$1"
+    df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+# Block until at least min_free_gb is available on the target filesystem.
+wait_for_min_free_space() {
+    local target_path="$1"
+    local min_free_gb="$2"
+    local sleep_sec="$3"
+    local min_free_kib=$(( min_free_gb * 1024 * 1024 ))
+
+    while true; do
+        local free_kib
+        free_kib=$(get_free_kib "$target_path")
+
+        if [[ -z "$free_kib" || ! "$free_kib" =~ ^[0-9]+$ ]]; then
+            echo "WARNING: Could not determine free space for '$target_path'; sleeping $(fmt_duration "$sleep_sec") before retry." >&2
+            sleep "$sleep_sec"
+            continue
+        fi
+
+        local free_gb
+        free_gb=$(awk -v kib="$free_kib" 'BEGIN { printf "%.2f", kib/1024/1024 }')
+
+        if (( free_kib >= min_free_kib )); then
+            echo "Disk space check: ${free_gb} GB free (required: ${min_free_gb} GB) — proceeding."
+            return 0
+        fi
+
+        echo "Disk space check: ${free_gb} GB free (required: ${min_free_gb} GB)."
+        echo "  Not enough free disk for synthoseis staging (~25 GB/dataset + safety margin)."
+        echo "  Sleeping $(fmt_duration "$sleep_sec") before rechecking."
+        sleep "$sleep_sec"
+    done
+}
+
 # Read the most recent "Epoch time: Xh Ym Zs | ..." line; return elapsed seconds (0 if absent).
 read_epoch_secs_from_log() {
     local log_file="$1"
@@ -135,23 +165,19 @@ read_epoch_secs_from_log() {
     parse_epoch_secs "$raw"
 }
 
-# Read the most recent split line; return total dataset count (train + val), or 0.
-# Parses "Restored split: N train, M val" or "Dataset split (N% val): N train, M val".
-read_total_datasets_from_log() {
-    local log_file="$1"
-    [[ -z "$log_file" || ! -f "$log_file" ]] && echo 0 && return
-    local line
-    line=$(grep -E '(Restored split|Dataset split)' "$log_file" 2>/dev/null | tail -n 1 || true)
-    [[ -z "$line" ]] && echo 0 && return
-    local n_train=0 n_val=0
-    [[ "$line" =~ ([0-9]+)\ train ]] && n_train="${BASH_REMATCH[1]}"
-    [[ "$line" =~ ([0-9]+)\ val ]]   && n_val="${BASH_REMATCH[1]}"
-    echo $(( n_train + n_val ))
-}
-
 # ── sanity checks ─────────────────────────────────────────────────────────────
 if [[ ! -d "$ZARR_FOLDER" ]]; then
     echo "ERROR: ZARR_FOLDER '$ZARR_FOLDER' does not exist." >&2
+    exit 1
+fi
+
+if [[ ! "$MIN_FREE_GB" =~ ^[0-9]+$ ]] || (( MIN_FREE_GB <= 0 )); then
+    echo "ERROR: --min-free-gb must be a positive integer (got: '$MIN_FREE_GB')." >&2
+    exit 1
+fi
+
+if [[ ! "$RECHECK_SLEEP_SEC" =~ ^[0-9]+$ ]] || (( RECHECK_SLEEP_SEC <= 0 )); then
+    echo "ERROR: --disk-recheck-sec must be a positive integer (got: '$RECHECK_SLEEP_SEC')." >&2
     exit 1
 fi
 
@@ -179,6 +205,8 @@ echo "  Runs requested : $NUM_RUNS"
 echo "  Start index    : $(printf '%04d' "$START_INDEX")"
 echo "  Config         : $CONFIG"
 echo "  Zarr folder    : $ZARR_FOLDER"
+echo "  Min free space : ${MIN_FREE_GB} GB"
+echo "  Recheck sleep  : $(fmt_duration "$RECHECK_SLEEP_SEC") (${RECHECK_SLEEP_SEC}s)"
 [[ -n "$CHECK_LOG" ]] && echo "  Training log   : $CHECK_LOG"
 if [[ "$NO_REPLACE" == "true" ]]; then
     echo "  Mode           : append-only (default)"
@@ -186,12 +214,6 @@ else
     echo "  Mode           : replace-oldest (--replace-oldest)"
 fi
 echo ""
-
-# ── throttle state ────────────────────────────────────────────────────────────
-# batch_start_time: wall-clock second when the current epoch-paced batch began.
-# runs_in_batch:    successful replacements completed in this batch.
-batch_start_time=$(date +%s)
-runs_in_batch=0
 
 for (( i=0; i<NUM_RUNS; i++ )); do
     run_idx=$(( START_INDEX + i ))
@@ -202,39 +224,12 @@ for (( i=0; i<NUM_RUNS; i++ )); do
     echo "Run $((i+1))/$NUM_RUNS  →  tag: $run_tag"
     echo "──────────────────────────────────────────"
 
-    # ── 0. Throttle: ≤ ⌊total_datasets/3⌋ replacements per training epoch ──
-    if [[ -n "$CHECK_LOG" ]]; then
-        epoch_secs=$(read_epoch_secs_from_log "$CHECK_LOG")
-        total_ds=$(read_total_datasets_from_log "$CHECK_LOG")
-        if (( epoch_secs > 0 && total_ds > 0 )); then
-            max_per_epoch=$(( total_ds / 3 ))
-            (( max_per_epoch < 1 )) && max_per_epoch=1
-            if (( runs_in_batch >= max_per_epoch )); then
-                now=$(date +%s)
-                elapsed=$(( now - batch_start_time ))
-                remaining=$(( epoch_secs - elapsed ))
-                if (( remaining > 0 )); then
-                    echo "Throttle: ${runs_in_batch}/${max_per_epoch} replacements done" \
-                         "in $(fmt_duration $elapsed) (epoch=$(fmt_duration $epoch_secs)," \
-                         "total_ds=${total_ds})."
-                    echo "  Sleeping $(fmt_duration $remaining) to pace with training epoch..."
-                    sleep "$remaining"
-                else
-                    echo "Throttle: ${runs_in_batch}/${max_per_epoch} replacements done;" \
-                         "epoch already elapsed — resetting batch."
-                fi
-                batch_start_time=$(date +%s)
-                runs_in_batch=0
-            else
-                echo "Throttle: ${runs_in_batch}/${max_per_epoch} replacements this batch" \
-                     "(epoch=$(fmt_duration $epoch_secs), total_ds=${total_ds})."
-            fi
-        else
-            echo "Throttle: no epoch timing in log yet; running freely."
-        fi
-    fi
+    # Safeguard: synthoseis can require substantial temporary staging space
+    # before it deletes non-essential zarr volumes.
+    wait_for_min_free_space "$ZARR_FOLDER" "$MIN_FREE_GB" "$RECHECK_SLEEP_SEC"
 
     # ── 1. Run synthoseis to produce a new dataset ──────────────────────────
+    run_start_secs=$(date +%s)
     pushd "$SYNTHOSEIS_DIR" > /dev/null
     uv run python -u main.py \
         -n 1 \
@@ -244,6 +239,7 @@ for (( i=0; i<NUM_RUNS; i++ )); do
         --zarr-out essential \
         2>&1 | tee "$log_file"
     popd > /dev/null
+    run_elapsed_secs=$(( $(date +%s) - run_start_secs ))
 
     # ── 2. Find the zarr that was just created ───────────────────────────────
     # synthoseis names its output:  seismic__<timestamp>_<run_tag>/model_data.zarr
@@ -266,22 +262,35 @@ for (( i=0; i<NUM_RUNS; i++ )); do
 
     if [[ "$NO_REPLACE" == "true" ]]; then
         echo "Append-only mode enabled; skipping replacement/deletion step."
+        if [[ -n "$CHECK_LOG" ]]; then
+            epoch_secs=$(read_epoch_secs_from_log "$CHECK_LOG")
+            if (( epoch_secs > 0 )); then
+                target_interval_secs=$(( epoch_secs / TARGET_NEW_PER_EPOCH ))
+                (( target_interval_secs < 1 )) && target_interval_secs=1
+                sleep_secs=$(( target_interval_secs - run_elapsed_secs ))
+                if (( sleep_secs > 0 )); then
+                    echo "Throttle: generation took $(fmt_duration $run_elapsed_secs);" \
+                         "target cadence is ${TARGET_NEW_PER_EPOCH}/epoch" \
+                         "(epoch=$(fmt_duration $epoch_secs))."
+                    echo "  Sleeping $(fmt_duration $sleep_secs) to pace generation."
+                    sleep "$sleep_secs"
+                else
+                    echo "Throttle: generation took $(fmt_duration $run_elapsed_secs)," \
+                         "already at/above target interval $(fmt_duration $target_interval_secs)."
+                fi
+            else
+                echo "Throttle: no epoch timing in log yet; running freely."
+            fi
+        fi
         echo ""
         continue
     fi
 
-    # ── 3. Identify the active training dataset (must not be replaced) ───────
-    active_ds=$(active_dataset_from_log "$CHECK_LOG")
-    [[ -n "$active_ds" ]] && echo "Active training dataset (protected): $active_ds" \
-                           || echo "No training log supplied; no dataset is protected."
-
-    # ── 4. Find oldest dataset that is NOT the new one and NOT the active one ─
+    # ── 3. Find oldest dataset that is NOT the new one ───────────────────────
     oldest=""
     while IFS= read -r ds_basename; do
         # Skip the dataset we just created
         [[ "$ds_basename" == "$(basename "$new_zarr_dir")" ]] && continue
-        # Skip the dataset currently in use by training
-        [[ -n "$active_ds" && "$ds_basename" == "$active_ds" ]] && continue
         oldest="$ds_basename"
         break
     done < <(list_datasets_oldest_first)
@@ -302,7 +311,28 @@ for (( i=0; i<NUM_RUNS; i++ )); do
 
     rm -rf "$oldest_path"
     echo "Removed: $oldest_path"
-    runs_in_batch=$(( runs_in_batch + 1 ))
+
+    if [[ -n "$CHECK_LOG" ]]; then
+        epoch_secs=$(read_epoch_secs_from_log "$CHECK_LOG")
+        if (( epoch_secs > 0 )); then
+            target_interval_secs=$(( epoch_secs / TARGET_NEW_PER_EPOCH ))
+            (( target_interval_secs < 1 )) && target_interval_secs=1
+            sleep_secs=$(( target_interval_secs - run_elapsed_secs ))
+            if (( sleep_secs > 0 )); then
+                echo "Throttle: generation took $(fmt_duration $run_elapsed_secs);" \
+                     "target cadence is ${TARGET_NEW_PER_EPOCH}/epoch" \
+                     "(epoch=$(fmt_duration $epoch_secs))."
+                echo "  Sleeping $(fmt_duration $sleep_secs) to pace generation."
+                sleep "$sleep_secs"
+            else
+                echo "Throttle: generation took $(fmt_duration $run_elapsed_secs)," \
+                     "already at/above target interval $(fmt_duration $target_interval_secs)."
+            fi
+        else
+            echo "Throttle: no epoch timing in log yet; running freely."
+        fi
+    fi
+
     echo ""
 
 done
