@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+.uv/
+
+# PyTest
+.pytest_cache/
+
+# Editor and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.py.txt
+cpu_mem_stats_*.csv
+purgatory/
+scripts/
+
+# Training runtime artifacts
+checkpoints.run_*/
+checkpoints/partial_latest.pt
+checkpoints/thermal_latest.pt
+checkpoints/checkpoint_epoch_*.pt
+checkpoints/runs/
+*.pt
+events.out.tfevents.*
+
+# uv lockfile
+uv.lock

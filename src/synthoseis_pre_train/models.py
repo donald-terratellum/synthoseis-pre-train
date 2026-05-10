@@ -199,8 +199,13 @@ class UNetDecoder3d(nn.Module):
         self.dec_blocks = nn.ModuleList()
         for i in range(len(dims) - 1):
             deep_ch, skip_ch = dims[i], dims[i + 1]
+            # Replace transposed conv upsampling (checkerboard artifacts)
+            # with artifact-free upsample (trilinear) followed by a Conv3d.
             self.upsamples.append(
-                nn.ConvTranspose3d(deep_ch, skip_ch, kernel_size=2, stride=2, bias=False)
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False),
+                    nn.Conv3d(deep_ch, skip_ch, kernel_size=3, padding=1, bias=False),
+                )
             )
             self.dec_blocks.append(ResBlock3d(2 * skip_ch, skip_ch))
 
