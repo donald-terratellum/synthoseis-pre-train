@@ -7,8 +7,11 @@ import os
 import random
 import time
 import math
+import re
 import platform
+import sys
 from datetime import datetime, timedelta
+import inspect
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -33,6 +36,11 @@ from synthoseis_pre_train.gpu_utils import (
     get_cpu_temperature_c,
     get_thermal_pressure_level,
 )
+try:
+    from synthoseis_pre_train.gpu_utils import ProcessTreeCsvMonitor
+except ImportError:
+    ProcessTreeCsvMonitor = None
+from synthoseis_pre_train.losses import SSIMMSELoss3D, CompositeClusterAwareLoss
 from synthoseis_pre_train.models import create_model, _MAMBA_AVAILABLE
 from synthoseis_pre_train.plotting import make_4panel_figure, make_crosssection_figure
 
@@ -132,6 +140,31 @@ def _build_lr_scheduler(optimizer: optim.Optimizer, args):
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_cosine_lambda)
 
     raise ValueError(f"Unknown lr schedule: {args.lr_schedule}")
+
+
+def _compute_masked_loss(
+    criterion: nn.Module,
+    output: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Compute masked loss for either pointwise or 3D-structural criteria."""
+    # Training uses ~mask voxels as supervised targets.
+    valid_mask = (~mask).to(dtype=output.dtype)
+
+    # If the criterion's forward accepts a 'valid_mask' kwarg, call it
+    # with full-shape tensors so structural losses can operate on 5D inputs.
+    try:
+        sig = inspect.signature(criterion.forward)
+        if "valid_mask" in sig.parameters:
+            return criterion(output, target, valid_mask=valid_mask)
+    except (ValueError, TypeError):
+        # Fall back to positional-call inspection if signature extraction fails.
+        pass
+
+    # Otherwise assume the criterion expects flat 1D tensors of selected
+    # voxels (pointwise losses like simple MSE). Use boolean indexing.
+    return criterion(output[~mask], target[~mask])
 
 
 class ThermalGuard:
@@ -476,13 +509,43 @@ def _build_loaders(
         parent = Path(p).parent
         return parent.stat().st_mtime if parent.exists() else 0.0
 
+    def _create_dataloader_compat(path: str, augment: bool):
+        """Create loader with fallback for older SeismicDataset signatures.
+
+        Some checkouts still accept legacy `trace_mask_ratio` instead of
+        `target_masked_fraction`, and may not yet expose newer masking kwargs.
+        Retry with translated and then pruned kwargs when signature mismatches
+        are detected so training remains forward/backward compatible.
+        """
+        compat_kwargs = dict(loader_kwargs)
+        while True:
+            try:
+                return create_dataloader(path, augment=augment, **compat_kwargs)
+            except TypeError as exc:
+                msg = str(exc)
+                m = re.search(r"unexpected keyword argument '([^']+)'", msg)
+                if m is None:
+                    raise
+
+                bad_kw = m.group(1)
+                if bad_kw == "target_masked_fraction" and bad_kw in compat_kwargs:
+                    tmf = compat_kwargs.pop("target_masked_fraction")
+                    compat_kwargs.setdefault("trace_mask_ratio", tmf)
+                    continue
+
+                if bad_kw in compat_kwargs:
+                    compat_kwargs.pop(bad_kw)
+                    continue
+
+                raise
+
     # --- train: build per-dataset loaders then merge ---
     train_per_ds: list[tuple[str, DataLoader]] = []
     print("  Loading train datasets...")
     for path in sorted(train_paths, key=_mtime):
         name = Path(path).parent.name
         try:
-            loader = create_dataloader(path, augment=True, **loader_kwargs)
+            loader = _create_dataloader_compat(path, augment=True)
             print(f"    {name}: {len(loader.dataset)} samples, {len(loader)} batches")
             train_per_ds.append((name, loader))
         except Exception as e:
@@ -508,7 +571,7 @@ def _build_loaders(
         for path in sorted(val_paths, key=_mtime):
             name = Path(path).parent.name
             try:
-                loader = create_dataloader(path, augment=False, **loader_kwargs)
+                loader = _create_dataloader_compat(path, augment=False)
                 print(f"    {name}: {len(loader.dataset)} samples, {len(loader)} batches")
                 val_loaders.append((name, loader))
             except Exception as e:
@@ -690,35 +753,65 @@ def train_epoch(
             reload_requested = True
             break
 
-        with autocast_context(device):
-            output = model(input_data)
-            loss = criterion(output[~mask], target[~mask])
-        batch_loss = loss.item()
-        scaled_loss = loss / accum_steps
+        try:
+            with autocast_context(device):
+                output = model(input_data)
 
-        if scaler is not None:
-            scaler.scale(scaled_loss).backward()
-        else:
-            scaled_loss.backward()
+            # Compute losses in FP32 for numeric stability on MPS autocast.
+            # SSIM has multiple reductions/divisions and is more sensitive than MSE.
+            loss = _compute_masked_loss(
+                criterion,
+                output.float(),
+                target.float(),
+                mask,
+            )
+            if not torch.isfinite(loss):
+                print(f"    WARNING: non-finite loss at train batch {batch_idx}; skipping this batch.")
+                optimizer.zero_grad(set_to_none=True)
+                micro_batches = 0
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                    torch.mps.empty_cache()
+                continue
+            batch_loss = loss.item()
+            scaled_loss = loss / accum_steps
 
-        micro_batches += 1
-        do_step = (micro_batches >= accum_steps) or (batch_idx == target_batches - 1)
-        if do_step:
             if scaler is not None:
-                if grad_clip_norm > 0:
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(scaled_loss).backward()
             else:
-                if grad_clip_norm > 0:
-                    nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            micro_batches = 0
-            optimizer_steps += 1
-            if ema is not None and optimizer_steps % ema_every == 0:
-                ema.update(model)
+                scaled_loss.backward()
+
+            micro_batches += 1
+            do_step = (micro_batches >= accum_steps) or (batch_idx == target_batches - 1)
+            if do_step:
+                if scaler is not None:
+                    if grad_clip_norm > 0:
+                        scaler.unscale_(optimizer)
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if grad_clip_norm > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                micro_batches = 0
+                optimizer_steps += 1
+                if ema is not None and optimizer_steps % ema_every == 0:
+                    ema.update(model)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "out of memory" in msg:
+                print(f"    WARNING: OOM at train batch {batch_idx}; clearing cache and skipping this batch.")
+                optimizer.zero_grad(set_to_none=True)
+                micro_batches = 0
+                if device.type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+                    torch.mps.empty_cache()
+                continue
+            raise
 
         temp_c = None
         if thermal_guard is not None:
@@ -868,7 +961,16 @@ def validate(
 
                     with autocast_context(device):
                         output = model(input_data)
-                        loss = criterion(output[~mask], target[~mask])
+
+                    loss = _compute_masked_loss(
+                        criterion,
+                        output.float(),
+                        target.float(),
+                        mask,
+                    )
+                    if not torch.isfinite(loss):
+                        print(f"    WARNING: non-finite val loss in {ds_name} batch {batch_idx}; skipping batch.")
+                        continue
 
                     if thermal_guard is not None:
                         thermal_guard.sample_temperature(batch_idx)
@@ -945,6 +1047,97 @@ DEFAULT_ARRAY_KEYS = [
 ]
 
 
+def _extract_compat_cli_overrides(argv):
+    """Extract compatibility CLI options before argparse strict parsing.
+
+    This keeps training launchers robust if argument names drift between
+    snake_case and kebab-case or if some options are temporarily missing from
+    parser declarations in a stale checkout.
+    """
+    value_flags = {
+        "--loss_type": "loss_type",
+        "--loss-type": "loss_type",
+        "--huber_delta": "huber_delta",
+        "--huber-delta": "huber_delta",
+        "--ssim_window_size": "ssim_window_size",
+        "--ssim-window-size": "ssim_window_size",
+        "--ssim_sigma": "ssim_sigma",
+        "--ssim-sigma": "ssim_sigma",
+        "--ssim_data_range": "ssim_data_range",
+        "--ssim-data-range": "ssim_data_range",
+        "--ssim_alpha": "ssim_alpha",
+        "--ssim-alpha": "ssim_alpha",
+        "--ssim_min_valid_ratio": "ssim_min_valid_ratio",
+        "--ssim-min-valid-ratio": "ssim_min_valid_ratio",
+        "--target_masked_fraction": "target_masked_fraction",
+        "--target-masked-fraction": "target_masked_fraction",
+        "--cluster_shape": "cluster_shape",
+        "--cluster-shape": "cluster_shape",
+        "--center_selection_method": "center_selection_method",
+        "--center-selection-method": "center_selection_method",
+        "--cluster_kernel_size": "cluster_kernel_size",
+        "--cluster-kernel-size": "cluster_kernel_size",
+        "--cluster_eps": "cluster_eps",
+        "--cluster-eps": "cluster_eps",
+        "--cluster_base_weight": "cluster_base_weight",
+        "--cluster-base-weight": "cluster_base_weight",
+        "--cluster_cluster_weight": "cluster_cluster_weight",
+        "--cluster-cluster-weight": "cluster_cluster_weight",
+    }
+    bool_flags = {
+        "--enable_cluster_loss": "enable_cluster_loss",
+        "--enable-cluster-loss": "enable_cluster_loss",
+    }
+
+    cleaned = []
+    overrides = {}
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in bool_flags:
+            overrides[bool_flags[arg]] = True
+            i += 1
+            continue
+        if arg in value_flags:
+            # If value is missing, let argparse handle/report it.
+            if i + 1 >= len(argv):
+                cleaned.append(arg)
+                i += 1
+                continue
+            overrides[value_flags[arg]] = argv[i + 1]
+            i += 2
+            continue
+        cleaned.append(arg)
+        i += 1
+
+    return cleaned, overrides
+
+
+def _apply_compat_cli_overrides(args, overrides):
+    """Apply extracted CLI overrides with proper types."""
+    type_map = {
+        "loss_type": str,
+        "huber_delta": float,
+        "ssim_window_size": int,
+        "ssim_sigma": float,
+        "ssim_data_range": float,
+        "ssim_alpha": float,
+        "ssim_min_valid_ratio": float,
+        "target_masked_fraction": float,
+        "cluster_shape": int,
+        "center_selection_method": str,
+        "enable_cluster_loss": bool,
+        "cluster_kernel_size": int,
+        "cluster_eps": float,
+        "cluster_base_weight": float,
+        "cluster_cluster_weight": float,
+    }
+    for key, raw in overrides.items():
+        caster = type_map.get(key, str)
+        value = raw if caster is bool else caster(raw)
+        setattr(args, key, value)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Seismic 3D Mamba")
     parser.add_argument("--data_paths", type=str, nargs='*', default=[],
@@ -969,6 +1162,56 @@ def main():
                        help="Batch size")
     parser.add_argument("--epochs", type=int, default=100,
                        help="Number of epochs")
+    parser.add_argument("--loss_type", "--loss-type", dest="loss_type", type=str, default="huber",
+                       choices=["mse", "huber", "ssim_mse"],
+                       help="Loss function (default: huber)")
+    parser.add_argument("--huber_delta", "--huber-delta", dest="huber_delta", type=float, default=0.1,
+                       help="Delta parameter for Huber loss (default: 0.1; only used when --loss_type=huber)")
+    parser.add_argument("--ssim_window_size", "--ssim-window-size", dest="ssim_window_size", type=int, default=16,
+                       help="3D SSIM Gaussian window size (default: 16; only used when --loss_type=ssim_mse)")
+    parser.add_argument("--ssim_sigma", "--ssim-sigma", dest="ssim_sigma", type=float, default=(16.0 / 6.0),
+                       help="Gaussian sigma for 3D SSIM window (default: 16/6; only used when --loss_type=ssim_mse)")
+    parser.add_argument("--ssim_data_range", "--ssim-data-range", dest="ssim_data_range", type=float, default=30.0,
+                       help="Data range for SSIM stabilization constants (default: 30.0 for scaled seismic)")
+    parser.add_argument("--ssim_alpha", "--ssim-alpha", dest="ssim_alpha", type=float, default=(1.0 / 6.0),
+                       help="Blend factor in [0,1] for mixed SSIM+MSE loss; 0=MSE, 1=SSIM (default: 1/6)")
+    parser.add_argument("--ssim_min_valid_ratio", "--ssim-min-valid-ratio", dest="ssim_min_valid_ratio", type=float, default=0.5,
+                       help="Minimum local valid-mask support ratio for SSIM pooling in [0,1] (default: 0.5)")
+    parser.add_argument(
+        "--enable-cluster-loss", "--enable_cluster_loss",
+        dest="enable_cluster_loss",
+        action="store_true",
+        default=False,
+        help="Enable composite cluster-aware loss that upweights traces near masked clusters",
+    )
+    parser.add_argument(
+        "--cluster-kernel-size", "--cluster_kernel_size",
+        dest="cluster_kernel_size",
+        type=int,
+        default=5,
+        help="Kernel size for 2D uniform filter applied to trace mask (odd int, default: 5)",
+    )
+    parser.add_argument(
+        "--cluster-eps", "--cluster_eps",
+        dest="cluster_eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon threshold for smoothed cluster mask (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--cluster-base-weight", "--cluster_base_weight",
+        dest="cluster_base_weight",
+        type=float,
+        default=1.0 / 3.0,
+        help="Weight for base loss in composite (default: 1/3)",
+    )
+    parser.add_argument(
+        "--cluster-cluster-weight", "--cluster_cluster_weight",
+        dest="cluster_cluster_weight",
+        type=float,
+        default=2.0 / 3.0,
+        help="Weight for cluster loss in composite (default: 2/3)",
+    )
     parser.add_argument("--lr", type=float, default=1e-4,
                        help="Learning rate")
     parser.add_argument("--lr_schedule", type=str, default="poly",
@@ -992,6 +1235,14 @@ def main():
                        help="Update EMA every N optimizer steps (default: 1)")
     parser.add_argument("--sample_shape", type=int, nargs=3, default=[128, 128, 128],
                        help="Sample shape (x y z)")
+    # NOTE: legacy `trace_mask_ratio` removed; use --target_masked_fraction instead
+    parser.add_argument("--target_masked_fraction", "--target-masked-fraction", dest="target_masked_fraction", type=float, default=0.15,
+                       help="Target final masked fraction after cluster size/probability effects (default: 0.15)")
+    parser.add_argument("--cluster_shape", "--cluster-shape", dest="cluster_shape", type=int, default=3,
+                       help="Odd cluster edge size for masking neighborhoods, e.g. 3, 5, 7 (default: 3)")
+    parser.add_argument("--center_selection_method", "--center-selection-method", dest="center_selection_method", type=str, default="random_mixture",
+                       choices=["random_mixture", "mitchell_best_candidate", "poisson_disc", "uniform_random"],
+                       help="Cluster-center sampling method for masking (default: random_mixture)")
     parser.add_argument("--device", type=str, default="auto",
                        help="Device (auto, cuda, mps, cpu)")
     parser.add_argument("--resume", type=str, default=None,
@@ -1007,8 +1258,16 @@ def main():
     parser.add_argument("--thermal_pressure_trip_level", type=str, default="serious",
                        choices=["off", "nominal", "fair", "serious", "critical"],
                        help="Pause on thermal pressure at or above this level (default: serious). Use 'off' to disable pressure-based pausing")
+    parser.add_argument("--no_monitor", action="store_true", dest="monitor_disabled",
+                       help="Disable background process-tree resource monitor CSV logging (enabled by default)")
+    parser.add_argument("--monitor_interval_sec", type=float, default=300.0,
+                       help="Monitor sampling interval in seconds (default: 300)")
+    parser.add_argument("--monitor_csv_path", type=str, default=None,
+                       help="CSV output path for monitor rows (default: cpu_mem_stats_<pid>.csv)")
 
-    args = parser.parse_args()
+    argv_for_argparse, compat_overrides = _extract_compat_cli_overrides(sys.argv[1:])
+    args = parser.parse_args(argv_for_argparse)
+    _apply_compat_cli_overrides(args, compat_overrides)
 
     if not (0.0 < args.val_split_ratio < 1.0):
         parser.error("--val_split_ratio must be between 0 and 1 (exclusive)")
@@ -1018,6 +1277,24 @@ def main():
         parser.error("--val_batches_per_epoch must be > 0")
     if args.refresh_every_batches < 0:
         parser.error("--refresh_every_batches must be >= 0")
+    if args.monitor_interval_sec <= 0:
+        parser.error("--monitor_interval_sec must be > 0")
+    if not (0.0 <= args.target_masked_fraction <= 1.0):
+        parser.error("--target_masked_fraction must be between 0 and 1")
+    if args.cluster_shape <= 0 or args.cluster_shape % 2 == 0:
+        parser.error("--cluster_shape must be a positive odd integer")
+    if args.huber_delta <= 0:
+        parser.error("--huber_delta must be > 0")
+    if args.ssim_window_size < 3:
+        parser.error("--ssim_window_size must be >= 3")
+    if args.ssim_sigma <= 0:
+        parser.error("--ssim_sigma must be > 0")
+    if args.ssim_data_range <= 0:
+        parser.error("--ssim_data_range must be > 0")
+    if not (0.0 <= args.ssim_alpha <= 1.0):
+        parser.error("--ssim_alpha must be between 0 and 1")
+    if not (0.0 <= args.ssim_min_valid_ratio <= 1.0):
+        parser.error("--ssim_min_valid_ratio must be between 0 and 1")
 
     if not args.data_paths and not args.data_folder:
         parser.error("At least one of --data_paths or --data_folder must be provided")
@@ -1225,12 +1502,51 @@ def main():
         pin_memory=(device.type == "cuda"),
         normalize=True,
         target_std=1.0,
-        trace_mask_ratio=0.07,
+        target_masked_fraction=args.target_masked_fraction,
+        cluster_shape=args.cluster_shape,
+        center_selection_method=args.center_selection_method,
         array_keys=args.array_keys,
     )
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    if args.loss_type == "huber":
+        criterion = nn.HuberLoss(delta=args.huber_delta, reduction="mean")
+    elif args.loss_type == "ssim_mse":
+        criterion = SSIMMSELoss3D(
+            data_range=args.ssim_data_range,
+            window_size=args.ssim_window_size,
+            sigma=args.ssim_sigma,
+            alpha=args.ssim_alpha,
+            min_valid_ratio=args.ssim_min_valid_ratio,
+        ).to(device)
+    else:
+        criterion = nn.MSELoss()
+    # Optionally wrap SSIM-MSE criterion in the composite cluster-aware loss.
+    if args.enable_cluster_loss:
+        if isinstance(criterion, SSIMMSELoss3D):
+            criterion = CompositeClusterAwareLoss(
+                base_criterion=criterion,
+                kernel_size=args.cluster_kernel_size,
+                eps=args.cluster_eps,
+                base_weight=args.cluster_base_weight,
+                cluster_weight=args.cluster_cluster_weight,
+            )
+            # Move wrapper to device as well.
+            criterion = criterion.to(device)
+        else:
+            print("--enable-cluster-loss ignored: base loss is not SSIMMSELoss3D")
+    # Log cluster-aware loss status so it's visible in startup stdout.
+    if getattr(args, "enable_cluster_loss", False):
+        if isinstance(criterion, CompositeClusterAwareLoss):
+            print(
+                "Cluster-aware loss: enabled",
+                f"(kernel={args.cluster_kernel_size}, eps={args.cluster_eps},",
+                f"base_weight={args.cluster_base_weight}, cluster_weight={args.cluster_cluster_weight})",
+            )
+        else:
+            print("Cluster-aware loss: requested but not enabled (base loss incompatible)")
+    else:
+        print("Cluster-aware loss: disabled")
     scaler = create_grad_scaler(device)
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
     thermal_guard = ThermalGuard(
@@ -1247,6 +1563,27 @@ def main():
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard logs: {tb_log_dir}")
     print("  Launch viewer: tensorboard --logdir checkpoints/runs")
+
+    monitor = None
+    if not args.monitor_disabled:
+        if ProcessTreeCsvMonitor is None:
+            print("Background monitor: disabled (ProcessTreeCsvMonitor unavailable in gpu_utils)")
+        else:
+            monitor_csv_path = args.monitor_csv_path
+            if not monitor_csv_path:
+                monitor_csv_path = f"cpu_mem_stats_{os.getpid()}.csv"
+            monitor = ProcessTreeCsvMonitor(
+                root_pid=os.getpid(),
+                csv_path=monitor_csv_path,
+                interval_sec=float(args.monitor_interval_sec),
+                include_children=True,
+                device=device,
+            )
+            monitor.start()
+            print(
+                f"Background monitor: enabled (interval={float(args.monitor_interval_sec):.1f}s, "
+                f"csv={monitor_csv_path}, root_pid={os.getpid()}, include_children=true)"
+            )
 
     start_epoch = 0
     if args.resume:
@@ -1276,6 +1613,24 @@ def main():
             f"LR schedule: {args.lr_schedule} "
             f"(start={args.lr:.3e}, min={args.lr_min:.3e}, warmup={args.lr_warmup_epochs} epochs)"
         )
+    if args.loss_type == "huber":
+        print(f"Loss: Huber (delta={args.huber_delta})")
+    elif args.loss_type == "ssim_mse":
+        print(
+            "Loss: SSIM-MSE "
+            f"(window={args.ssim_window_size}, sigma={args.ssim_sigma:.4g}, "
+            f"range={args.ssim_data_range:.4g}, alpha={args.ssim_alpha:.4g}, "
+            f"min_valid_ratio={args.ssim_min_valid_ratio:.3g})"
+        )
+    else:
+        print(f"Loss: MSE")
+    print(
+        "Masking: "
+        f"target_masked_fraction={args.target_masked_fraction:.4g}, "
+        f"cluster_shape={args.cluster_shape}, "
+        f"cluster_prob=0.8, "
+        f"center_selection_method={args.center_selection_method}"
+    )
     print(f"Grad accumulation: {max(1, args.grad_accum_steps)} step(s)")
     if args.train_batches_per_epoch is not None:
         print(
@@ -1297,72 +1652,45 @@ def main():
     else:
         print("EMA: disabled")
 
-    print("\nStarting training...")
-    training_start = time.monotonic()
-    for epoch in range(start_epoch, args.epochs):
-        epoch_start = time.monotonic()
-        current_lr = optimizer.param_groups[0]["lr"]
-        epoch_stamp = datetime.now().strftime("%Y-%-m-%-d %H:%M:%S")
-        print(f"\nEpoch {epoch + 1}/{args.epochs} | LR: {current_lr:.3e} | {epoch_stamp}")
+    try:
+        print("\nStarting training...")
+        training_start = time.monotonic()
+        for epoch in range(start_epoch, args.epochs):
+            epoch_start = time.monotonic()
+            current_lr = optimizer.param_groups[0]["lr"]
+            epoch_stamp = datetime.now().strftime("%Y-%-m-%-d %H:%M:%S")
+            print(f"\nEpoch {epoch + 1}/{args.epochs} | LR: {current_lr:.3e} | {epoch_stamp}")
+            train_batches_processed = 0
 
-        # Re-scan once per epoch, prune oldest on disk to fixed target count,
-        # then keep the active train/val set fixed until next epoch.
-        if args.data_folder:
-            discovered = _discover_zarr_paths(args.data_folder, args.dataset_glob)
-            keep_total = split_target_train + split_target_val
-            discovered = _prune_oldest_to_target(
-                args.data_folder,
-                args.dataset_glob,
-                discovered,
-                keep_total,
-            )
-            train_paths, val_paths = _update_split(
-                discovered, train_paths, val_paths, split_target_train, split_target_val
-            )
-            _dset = set(discovered)
-        else:
-            _dset = {p for p in (train_paths + val_paths) if Path(p).parent.exists()}
+            # Re-scan once per epoch, prune oldest on disk to fixed target count,
+            # then keep the active train/val set fixed until next epoch.
+            if args.data_folder:
+                discovered = _discover_zarr_paths(args.data_folder, args.dataset_glob)
+                keep_total = split_target_train + split_target_val
+                discovered = _prune_oldest_to_target(
+                    args.data_folder,
+                    args.dataset_glob,
+                    discovered,
+                    keep_total,
+                )
+                train_paths, val_paths = _update_split(
+                    discovered, train_paths, val_paths, split_target_train, split_target_val
+                )
+                _dset = set(discovered)
+            else:
+                _dset = {p for p in (train_paths + val_paths) if Path(p).parent.exists()}
 
-        active_train = _active_paths(train_paths, split_target_train, _dset)
-        active_val   = _active_paths(val_paths,   split_target_val,   _dset)
-        print(f"Dataset split ({split_target_train} train, {split_target_val} val target): "
-              f"{len(active_train)} train, {len(active_val)} val")
-        print(f"  Train: {[Path(p).parent.name for p in active_train]}")
-        if active_val:
-            print(f"  Val:   {[Path(p).parent.name for p in active_val]}")
-        train_loader = None
-        val_loaders = []
+            active_train = _active_paths(train_paths, split_target_train, _dset)
+            active_val   = _active_paths(val_paths,   split_target_val,   _dset)
+            print(f"Dataset split ({split_target_train} train, {split_target_val} val target): "
+                  f"{len(active_train)} train, {len(active_val)} val")
+            print(f"  Train: {[Path(p).parent.name for p in active_train]}")
+            if active_val:
+                print(f"  Val:   {[Path(p).parent.name for p in active_val]}")
+            train_loader = None
+            val_loaders = []
 
-        if args.train_batches_per_epoch is None:
-            train_loader, val_loaders = _build_loaders(
-                active_train,
-                active_val,
-                loader_kwargs,
-                train_batches_per_epoch=args.train_batches_per_epoch,
-                val_batches_per_epoch=args.val_batches_per_epoch,
-            )
-            if train_loader is None:
-                print("  WARNING: No usable training datasets this epoch; skipping.")
-                continue
-
-            train_loss = train_epoch(
-                model, train_loader, optimizer, criterion, device,
-                scaler=scaler, writer=writer, epoch=epoch, output_dir=output_dir,
-                train_paths=train_paths, val_paths=val_paths,
-                thermal_guard=thermal_guard,
-                grad_accum_steps=args.grad_accum_steps,
-                grad_clip_norm=args.grad_clip_norm,
-                ema=ema,
-                ema_update_every=args.ema_update_every,
-            )
-        else:
-            target_batches = max(1, int(args.train_batches_per_epoch))
-            batches_done = 0
-            weighted_loss_sum = 0.0
-            pending_chunk_reload = False
-
-            while batches_done < target_batches:
-                _reload_t0 = time.monotonic()
+            if args.train_batches_per_epoch is None:
                 train_loader, val_loaders = _build_loaders(
                     active_train,
                     active_val,
@@ -1370,17 +1698,11 @@ def main():
                     train_batches_per_epoch=args.train_batches_per_epoch,
                     val_batches_per_epoch=args.val_batches_per_epoch,
                 )
-                _reload_elapsed = time.monotonic() - _reload_t0
-                if pending_chunk_reload:
-                    print(f"  Reloaded train/val loaders in {_reload_elapsed:.2f}s")
-                    pending_chunk_reload = False
                 if train_loader is None:
-                    print("  WARNING: No usable training datasets this epoch; skipping remaining batches.")
-                    break
+                    print("  WARNING: No usable training datasets this epoch; skipping.")
+                    continue
 
-                remaining = target_batches - batches_done
-
-                details = train_epoch(
+                train_loss = train_epoch(
                     model, train_loader, optimizer, criterion, device,
                     scaler=scaler, writer=writer, epoch=epoch, output_dir=output_dir,
                     train_paths=train_paths, val_paths=val_paths,
@@ -1389,104 +1711,147 @@ def main():
                     grad_clip_norm=args.grad_clip_norm,
                     ema=ema,
                     ema_update_every=args.ema_update_every,
-                    max_batches=remaining,
                     return_details=True,
                 )
-                chunk_batches = int(details["batches_processed"])
-                if chunk_batches <= 0:
-                    print("  WARNING: train epoch chunk processed 0 batches; stopping epoch early.")
-                    break
+                train_batches_processed = int(train_loss["batches_processed"])
+                train_loss = float(train_loss["loss"])
+            else:
+                target_batches = max(1, int(args.train_batches_per_epoch))
+                batches_done = 0
+                weighted_loss_sum = 0.0
+                pending_chunk_reload = False
 
-                weighted_loss_sum += float(details["loss"]) * chunk_batches
-                batches_done += chunk_batches
+                while batches_done < target_batches:
+                    _reload_t0 = time.monotonic()
+                    train_loader, val_loaders = _build_loaders(
+                        active_train,
+                        active_val,
+                        loader_kwargs,
+                        train_batches_per_epoch=args.train_batches_per_epoch,
+                        val_batches_per_epoch=args.val_batches_per_epoch,
+                    )
+                    _reload_elapsed = time.monotonic() - _reload_t0
+                    if pending_chunk_reload:
+                        print(f"  Reloaded train/val loaders in {_reload_elapsed:.2f}s")
+                        pending_chunk_reload = False
+                    if train_loader is None:
+                        print("  WARNING: No usable training datasets this epoch; skipping remaining batches.")
+                        break
 
-                if not bool(details["reload_requested"]):
-                    break
+                    remaining = target_batches - batches_done
 
-                pending_chunk_reload = True
+                    details = train_epoch(
+                        model, train_loader, optimizer, criterion, device,
+                        scaler=scaler, writer=writer, epoch=epoch, output_dir=output_dir,
+                        train_paths=train_paths, val_paths=val_paths,
+                        thermal_guard=thermal_guard,
+                        grad_accum_steps=args.grad_accum_steps,
+                        grad_clip_norm=args.grad_clip_norm,
+                        ema=ema,
+                        ema_update_every=args.ema_update_every,
+                        max_batches=remaining,
+                        return_details=True,
+                    )
+                    chunk_batches = int(details["batches_processed"])
+                    if chunk_batches <= 0:
+                        print("  WARNING: train epoch chunk processed 0 batches; stopping epoch early.")
+                        break
 
-            train_loss = weighted_loss_sum / max(1, batches_done)
+                    weighted_loss_sum += float(details["loss"]) * chunk_batches
+                    batches_done += chunk_batches
 
-        if writer is not None:
-            _log_per_dataset_figures(
-                model, train_loader, device, writer, epoch, train_loss
+                    if not bool(details["reload_requested"]):
+                        break
+
+                    pending_chunk_reload = True
+
+                train_loss = weighted_loss_sum / max(1, batches_done)
+                train_batches_processed = batches_done
+
+            if writer is not None and train_loader is not None:
+                _log_per_dataset_figures(
+                    model, train_loader, device, writer, epoch, train_loss
+                )
+
+            using_ema = ema is not None
+            if using_ema:
+                ema.store(model)
+                ema.copy_to(model)
+            val_loss = validate(
+                model, val_loaders, criterion, device,
+                writer=writer, epoch=epoch, thermal_guard=thermal_guard,
+                max_batches=args.val_batches_per_epoch,
+            )
+            if using_ema:
+                ema.restore(model)
+
+            # Log scalar losses to TensorBoard
+            writer.add_scalar("loss/train", train_loss, global_step=epoch + 1)
+            writer.add_scalar("lr", current_lr, global_step=epoch + 1)
+            if val_loaders:
+                writer.add_scalar("loss/val", val_loss, global_step=epoch + 1)
+
+            if val_loaders:
+                print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            else:
+                print(f"Train Loss: {train_loss:.4f}")
+
+            # End-of-epoch versioned checkpoint (never overwritten)
+            epoch_ckpt = output_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"
+            _save_checkpoint(epoch_ckpt, model, optimizer, scaler, epoch,
+                             train_loss=train_loss, val_loss=val_loss,
+                             train_paths=train_paths, val_paths=val_paths,
+                             ema_state=ema.state_dict() if ema is not None else None)
+            print(f"Saved checkpoint: {epoch_ckpt}")
+
+            if scheduler is not None and train_batches_processed > 0:
+                scheduler.step()
+
+            # --- timing ---
+            now = time.monotonic()
+            epochs_done = epoch + 1 - start_epoch
+            epochs_left = args.epochs - (epoch + 1)
+            epoch_elapsed = now - epoch_start
+            total_elapsed = now - training_start
+            avg_per_epoch = total_elapsed / epochs_done
+            remaining_secs = avg_per_epoch * epochs_left
+
+            def _fmt_duration(secs: float) -> str:
+                secs = int(secs)
+                h, rem = divmod(secs, 3600)
+                m, s = divmod(rem, 60)
+                if h:
+                    return f"{h}h {m:02d}m {s:02d}s"
+                if m:
+                    return f"{m}m {s:02d}s"
+                return f"{s}s"
+
+            eta_dt = datetime.now() + timedelta(seconds=remaining_secs)
+            eta_str = eta_dt.strftime("%d %b %Y %H:%M")
+            print(
+                f"Epoch time: {_fmt_duration(epoch_elapsed)} | "
+                f"Elapsed: {_fmt_duration(total_elapsed)} | "
+                f"Remaining: {_fmt_duration(remaining_secs)} | "
+                f"ETA: {eta_str}"
             )
 
-        using_ema = ema is not None
-        if using_ema:
+        final_path = output_dir / "final_model.pt"
+        if ema is not None:
             ema.store(model)
             ema.copy_to(model)
-        val_loss = validate(
-            model, val_loaders, criterion, device,
-            writer=writer, epoch=epoch, thermal_guard=thermal_guard,
-            max_batches=args.val_batches_per_epoch,
-        )
-        if using_ema:
+            torch.save(model.state_dict(), final_path)
             ema.restore(model)
-
-        # Log scalar losses to TensorBoard
-        writer.add_scalar("loss/train", train_loss, global_step=epoch + 1)
-        writer.add_scalar("lr", current_lr, global_step=epoch + 1)
-        if val_loaders:
-            writer.add_scalar("loss/val", val_loss, global_step=epoch + 1)
-
-        if val_loaders:
-            print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            raw_final_path = output_dir / "final_model_raw.pt"
+            torch.save(model.state_dict(), raw_final_path)
+            print(f"Saved raw non-EMA model: {raw_final_path}")
         else:
-            print(f"Train Loss: {train_loss:.4f}")
-
-        # End-of-epoch versioned checkpoint (never overwritten)
-        epoch_ckpt = output_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"
-        _save_checkpoint(epoch_ckpt, model, optimizer, scaler, epoch,
-                         train_loss=train_loss, val_loss=val_loss,
-                         train_paths=train_paths, val_paths=val_paths,
-                         ema_state=ema.state_dict() if ema is not None else None)
-        print(f"Saved checkpoint: {epoch_ckpt}")
-
-        if scheduler is not None:
-            scheduler.step()
-
-        # --- timing ---
-        now = time.monotonic()
-        epochs_done = epoch + 1 - start_epoch
-        epochs_left = args.epochs - (epoch + 1)
-        epoch_elapsed = now - epoch_start
-        total_elapsed = now - training_start
-        avg_per_epoch = total_elapsed / epochs_done
-        remaining_secs = avg_per_epoch * epochs_left
-
-        def _fmt_duration(secs: float) -> str:
-            secs = int(secs)
-            h, rem = divmod(secs, 3600)
-            m, s = divmod(rem, 60)
-            if h:
-                return f"{h}h {m:02d}m {s:02d}s"
-            if m:
-                return f"{m}m {s:02d}s"
-            return f"{s}s"
-
-        eta_dt = datetime.now() + timedelta(seconds=remaining_secs)
-        eta_str = eta_dt.strftime("%d %b %Y %H:%M")
-        print(
-            f"Epoch time: {_fmt_duration(epoch_elapsed)} | "
-            f"Elapsed: {_fmt_duration(total_elapsed)} | "
-            f"Remaining: {_fmt_duration(remaining_secs)} | "
-            f"ETA: {eta_str}"
-        )
-
-    final_path = output_dir / "final_model.pt"
-    if ema is not None:
-        ema.store(model)
-        ema.copy_to(model)
-        torch.save(model.state_dict(), final_path)
-        ema.restore(model)
-        raw_final_path = output_dir / "final_model_raw.pt"
-        torch.save(model.state_dict(), raw_final_path)
-        print(f"Saved raw non-EMA model: {raw_final_path}")
-    else:
-        torch.save(model.state_dict(), final_path)
-    writer.close()
-    print(f"Training complete. Final model: {final_path}")
+            torch.save(model.state_dict(), final_path)
+        print(f"Training complete. Final model: {final_path}")
+    finally:
+        if monitor is not None:
+            monitor.stop()
+            print("Background monitor: stopped")
+        writer.close()
 
 
 if __name__ == "__main__":

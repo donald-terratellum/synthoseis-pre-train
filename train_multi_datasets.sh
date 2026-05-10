@@ -8,6 +8,14 @@ set -euo pipefail
 # Suppress noisy macOS allocator warnings inherited by Python subprocesses.
 # Setting to "0" (not unset) is an explicit disable signal to libmalloc.
 if [[ "${OSTYPE:-}" == darwin* ]]; then
+  # Some shells carry additional Malloc* variables that make tools like awk
+  # print "MallocStackLogging ... No such file or directory". Normalize all
+  # of them to 0 for this process tree.
+  for _v in $(compgen -v); do
+    if [[ "${_v}" == Malloc* ]]; then
+      export "${_v}=0"
+    fi
+  done
   export MallocStackLogging=0
   export MallocStackLoggingNoCompact=0
 fi
@@ -464,46 +472,58 @@ mkdir -p "${OUTPUT_DIR}"
 # Train — run the local train.py explicitly so forwarded args match local parser.
 # train.py re-scans DATA_FOLDER at the start of each epoch and incorporates new datasets.
 # Using an explicit path avoids accidentally invoking a different installed script.
-python -u ./train.py \
-    --data_folder "${DATA_FOLDER}" \
-    --batch_size "${BATCH_SIZE}" \
-    --epochs "${MAX_EPOCHS}" \
-    --sample_shape ${SAMPLE_SHAPE} \
-    --device "${DEVICE}" \
-    --output_dir "${OUTPUT_DIR}" \
-    --target_masked_fraction "${TARGET_MASKED_FRACTION}" \
-    --cluster_shape "${CLUSTER_SHAPE}" \
-    --center_selection_method "${CENTER_SELECTION_METHOD}" \
-    --train_batches_per_epoch "${TRAIN_BATCHES_PER_EPOCH}" \
-    --val_batches_per_epoch "${VAL_BATCHES_PER_EPOCH}" \
-    --refresh_every_batches "${REFRESH_EVERY_BATCHES}" \
-    --val_split_ratio "${VAL_SPLIT_RATIO}" \
-    --thermal_max_c "${THERMAL_MAX_C}" \
-    --thermal_cooldown_sec "${THERMAL_COOLDOWN_SEC}" \
-    --thermal_check_every_batches "${THERMAL_CHECK_EVERY_BATCHES}" \
-    --thermal_pressure_trip_level "${THERMAL_PRESSURE_TRIP_LEVEL}" \
-    --lr_schedule "${LR_SCHEDULE}" \
-    --lr_poly_power "${LR_POLY_POWER}" \
-    --lr_min "${LR_MIN}" \
-    --lr_warmup_epochs "${LR_WARMUP_EPOCHS}" \
-    --lr_warmup_start_factor "${LR_WARMUP_START_FACTOR}" \
-    --grad_accum_steps "${GRAD_ACCUM_STEPS}" \
-    --grad_clip_norm "${GRAD_CLIP_NORM}" \
-    --ema_decay "${EMA_DECAY}" \
-    --ema_update_every "${EMA_UPDATE_EVERY}" \
-    --loss_type "${LOSS_TYPE}" \
-    --huber_delta "${HUBER_DELTA}" \
-    --ssim_window_size "${SSIM_WINDOW_SIZE}" \
-    --ssim_sigma "${SSIM_SIGMA}" \
-    --ssim_data_range "${SSIM_DATA_RANGE}" \
-    --ssim_alpha "${SSIM_ALPHA}" \
-    --ssim_min_valid_ratio "${SSIM_MIN_VALID_RATIO}" \
-    ${ENABLE_CLUSTER_LOSS:+--enable_cluster_loss} \
-    --cluster_kernel_size "${CLUSTER_KERNEL_SIZE}" \
-    --cluster_eps "${CLUSTER_EPS}" \
-    --cluster_base_weight "${CLUSTER_BASE_WEIGHT}" \
-    --cluster_cluster_weight "${CLUSTER_CLUSTER_WEIGHT}" \
-    ${RESUME:+--resume "${RESUME}"}
+PYRUN=""
+if command -v uv >/dev/null 2>&1; then
+  PYRUN="uv run python -u"
+elif command -v python3 >/dev/null 2>&1; then
+  PYRUN="python3 -u"
+elif command -v python >/dev/null 2>&1; then
+  PYRUN="python -u"
+else
+  echo "ERROR: no suitable python interpreter found (tried: uv, python3, python)"
+  exit 1
+fi
+
+$PYRUN ./train.py \
+  --data_folder "${DATA_FOLDER}" \
+  --batch_size "${BATCH_SIZE}" \
+  --epochs "${MAX_EPOCHS}" \
+  --sample_shape ${SAMPLE_SHAPE} \
+  --device "${DEVICE}" \
+  --output_dir "${OUTPUT_DIR}" \
+  --target_masked_fraction "${TARGET_MASKED_FRACTION}" \
+  --cluster_shape "${CLUSTER_SHAPE}" \
+  --center_selection_method "${CENTER_SELECTION_METHOD}" \
+  --train_batches_per_epoch "${TRAIN_BATCHES_PER_EPOCH}" \
+  --val_batches_per_epoch "${VAL_BATCHES_PER_EPOCH}" \
+  --refresh_every_batches "${REFRESH_EVERY_BATCHES}" \
+  --val_split_ratio "${VAL_SPLIT_RATIO}" \
+  --thermal_max_c "${THERMAL_MAX_C}" \
+  --thermal_cooldown_sec "${THERMAL_COOLDOWN_SEC}" \
+  --thermal_check_every_batches "${THERMAL_CHECK_EVERY_BATCHES}" \
+  --thermal_pressure_trip_level "${THERMAL_PRESSURE_TRIP_LEVEL}" \
+  --lr_schedule "${LR_SCHEDULE}" \
+  --lr_poly_power "${LR_POLY_POWER}" \
+  --lr_min "${LR_MIN}" \
+  --lr_warmup_epochs "${LR_WARMUP_EPOCHS}" \
+  --lr_warmup_start_factor "${LR_WARMUP_START_FACTOR}" \
+  --grad_accum_steps "${GRAD_ACCUM_STEPS}" \
+  --grad_clip_norm "${GRAD_CLIP_NORM}" \
+  --ema_decay "${EMA_DECAY}" \
+  --ema_update_every "${EMA_UPDATE_EVERY}" \
+  --loss_type "${LOSS_TYPE}" \
+  --huber_delta "${HUBER_DELTA}" \
+  --ssim_window_size "${SSIM_WINDOW_SIZE}" \
+  --ssim_sigma "${SSIM_SIGMA}" \
+  --ssim_data_range "${SSIM_DATA_RANGE}" \
+  --ssim_alpha "${SSIM_ALPHA}" \
+  --ssim_min_valid_ratio "${SSIM_MIN_VALID_RATIO}" \
+  ${ENABLE_CLUSTER_LOSS:+--enable_cluster_loss} \
+  --cluster_kernel_size "${CLUSTER_KERNEL_SIZE}" \
+  --cluster_eps "${CLUSTER_EPS}" \
+  --cluster_base_weight "${CLUSTER_BASE_WEIGHT}" \
+  --cluster_cluster_weight "${CLUSTER_CLUSTER_WEIGHT}" \
+  ${RESUME:+--resume "${RESUME}"}
 
 echo "=== Multi-dataset training complete ==="
 #!/usr/bin/env bash
@@ -773,33 +793,7 @@ fi
 echo "Found ${INITIAL_COUNT} dataset folder(s) in ${DATA_FOLDER} at startup"
 echo ""
 
-# Train — train.py re-scans DATA_FOLDER at the start of each epoch and
-# incorporates new datasets automatically.  The set-difference split logic
-# guarantees that no dataset ever appears in both train and val.
-uv run python -u train.py \
-    --data_folder "${DATA_FOLDER}" \
-    --batch_size "${BATCH_SIZE}" \
-    --epochs "${MAX_EPOCHS}" \
-    --sample_shape ${SAMPLE_SHAPE} \
-    --device "${DEVICE}" \
-    --output_dir "checkpoints" \
-    --train_batches_per_epoch "${TRAIN_BATCHES_PER_EPOCH}" \
-    --val_batches_per_epoch "${VAL_BATCHES_PER_EPOCH}" \
-    --refresh_every_batches "${REFRESH_EVERY_BATCHES}" \
-    --val_split_ratio "${VAL_SPLIT_RATIO}" \
-    --thermal_max_c "${THERMAL_MAX_C}" \
-    --thermal_cooldown_sec "${THERMAL_COOLDOWN_SEC}" \
-    --thermal_check_every_batches "${THERMAL_CHECK_EVERY_BATCHES}" \
-    --thermal_pressure_trip_level "${THERMAL_PRESSURE_TRIP_LEVEL}" \
-    --lr_schedule "${LR_SCHEDULE}" \
-    --lr_poly_power "${LR_POLY_POWER}" \
-    --lr_min "${LR_MIN}" \
-    --lr_warmup_epochs "${LR_WARMUP_EPOCHS}" \
-    --lr_warmup_start_factor "${LR_WARMUP_START_FACTOR}" \
-    --grad_accum_steps "${GRAD_ACCUM_STEPS}" \
-    --grad_clip_norm "${GRAD_CLIP_NORM}" \
-    --ema_decay "${EMA_DECAY}" \
-    --ema_update_every "${EMA_UPDATE_EVERY}" \
-    ${RESUME:+--resume "${RESUME}"}
-
-echo "=== Multi-dataset training complete ==="
+# Training is invoked earlier via the $PYRUN block above which forwards
+# all relevant loss/SSIM/cluster flags to the local ./train.py.  The older
+# direct invocation using `uv run python -u train.py` was removed to avoid
+# accidentally running a different `train.py` from PATH.
