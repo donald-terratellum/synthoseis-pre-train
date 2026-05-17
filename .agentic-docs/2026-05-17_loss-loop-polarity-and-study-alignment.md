@@ -7,7 +7,7 @@
 ## Completed in this session
 - Updated `scripts/losses_study.py` so the reported values match the current training semantics:
   - Huber losses are multiplied by `10`.
-  - SSIM losses are multiplied by `1000`.
+  - SSIM losses are multiplied by `200` in the current training loop, matching the active `--ssim-alpha 0.2` setup.
   - Added signed comparisons for both raw and histogram-equalized volumes:
     - `(label, -label)`
     - `(input, -input)`
@@ -21,12 +21,17 @@
 - Updated the train/validation loops so the active loss path uses the same study-scaled conventions:
   - MSE stays unchanged.
   - Huber is scaled by `10`.
-  - SSIM is scaled by `1000`.
+  - SSIM is scaled by `200` in the current study-aligned runtime path.
   - The loop respects `--ssim-implementation` rather than assuming a single SSIM backend.
 - Added per-example stdout logging in the training loop so each sample in a processed batch prints a line after the batch has been used for backpropagation.
 - Confirmed the zero-good loss assumption:
   - Training still minimizes a scalar loss.
   - Lower values are better and zero is the ideal target for the active objective.
+- Added and refined study scripts under `scripts/` to diagnose histogram-equalization behavior before and after the standard-normal transform:
+  - clipping scan code to check whether endpoint clamping introduces repeated values or flattened plateaus
+  - extrema-index study code to measure how repeated values affect peak/trough recovery
+  - prefilter-only extrema detection in the study path so extrema search is less sensitive to tie runs and repeated samples
+  - endpoint-extended interpolation/clamping checks so the study path matches production histogram-equalizer semantics
 
 ## Codebase changes since the 2026-05-10 summary
 - Recent branch commits anchored at the 2026-05-10 summary point:
@@ -36,6 +41,7 @@
   - `80b404c` - Replace `ConvTranspose3d` with `Upsample+Conv3d` in the decoder and add decoder tests.
   - `746b256` - Session-summary/docs and cluster-aware loss, launcher, and train updates.
 - The current session then extended that foundation with loss-study tooling, SSIM scaling alignment, and runtime logging improvements.
+- The current session also tightened the histogram-equalization study path so standard-normal conversion, clipping behavior, and extrema detection are evaluated with less sensitivity to repeated values.
 - The current diagnosis is that the model can preserve reflector geometry while still drifting into opposite-polarity predictions under SSIM-heavy training; the objective remains minimization, but SSIM alone is not sufficiently sign-preserving for seismic reconstruction.
 
 ## Validation notes

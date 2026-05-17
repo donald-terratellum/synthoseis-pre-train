@@ -25,6 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
+from scipy.ndimage import binary_dilation
 
 from synthoseis_pre_train.dataloader import create_dataloader
 from synthoseis_pre_train.gpu_utils import (
@@ -40,8 +41,12 @@ try:
     from synthoseis_pre_train.gpu_utils import ProcessTreeCsvMonitor
 except ImportError:
     ProcessTreeCsvMonitor = None
-from synthoseis_pre_train.losses import SSIMMSELoss3D, CompositeClusterAwareLoss
-from synthoseis_pre_train.models import create_model, _MAMBA_AVAILABLE
+from synthoseis_pre_train.losses import SSIMMSELoss3D, MONAIStyleSSIMMSELoss3D, CompositeClusterAwareLoss
+# from synthoseis_pre_train.models import create_model, _MAMBA_AVAILABLE
+from synthoseis_pre_train.models import _MAMBA_AVAILABLE
+from synthoseis_pre_train.models import create_model as create_static_model
+from synthoseis_pre_train.dyn_models import create_dyn_model
+
 from synthoseis_pre_train.plotting import make_4panel_figure, make_crosssection_figure
 
 
@@ -84,6 +89,11 @@ def _format_elapsed_dhm(start_time: float) -> str:
     hours = int((elapsed % 86400) // 3600)
     minutes_decimal = (elapsed % 3600) / 60.0
     return f"{days:02d}:{hours:02d}:{minutes_decimal:04.1f}"
+
+
+def _format_seconds_compact(seconds: float) -> str:
+    """Format seconds for concise progress logs."""
+    return f"{max(0.0, float(seconds)):.1f}s"
 
 
 def _build_lr_scheduler(optimizer: optim.Optimizer, args):
@@ -165,6 +175,338 @@ def _compute_masked_loss(
     # Otherwise assume the criterion expects flat 1D tensors of selected
     # voxels (pointwise losses like simple MSE). Use boolean indexing.
     return criterion(output[~mask], target[~mask])
+
+
+def _compute_study_scaled_losses(
+    criterion: nn.Module,
+    mse_fn: nn.Module,
+    huber_fn: nn.Module,
+    ssim_fn: nn.Module,
+    output: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute study-aligned losses on supervised voxels with study scaling."""
+    mse = _compute_masked_loss(mse_fn, output, target, mask)
+    huber = _compute_masked_loss(huber_fn, output, target, mask) * 10.0
+
+    # If criterion is SSIM-based (possibly wrapped in CompositeClusterAwareLoss),
+    # use it directly so the loop respects --ssim-implementation and cluster mode.
+    if isinstance(criterion, (SSIMMSELoss3D, MONAIStyleSSIMMSELoss3D, CompositeClusterAwareLoss)):
+        ssim_base = _compute_masked_loss(criterion, output, target, mask)
+    else:
+        ssim_base = _compute_masked_loss(ssim_fn, output, target, mask)
+    ssim = ssim_base * 200.0
+    return mse, huber, ssim
+
+
+def _select_loss_by_type(
+    loss_type: str,
+    mse_loss: torch.Tensor,
+    huber_loss: torch.Tensor,
+    ssim_loss: torch.Tensor,
+) -> torch.Tensor:
+    """Select active optimization loss to match CLI --loss_type."""
+    if loss_type == "mse":
+        return mse_loss
+    if loss_type == "huber":
+        return huber_loss
+    return ssim_loss
+
+
+def _new_amplitude_stats() -> dict[str, float]:
+    """Create running-moment accumulator for amplitude diagnostics."""
+    return {
+        "count": 0.0,
+        "pred_sum": 0.0,
+        "pred_sq_sum": 0.0,
+        "target_sum": 0.0,
+        "target_sq_sum": 0.0,
+    }
+
+
+def _accumulate_amplitude_stats(
+    stats: dict[str, float],
+    output: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    """Accumulate moments over supervised voxels (~mask)."""
+    valid = ~mask
+    count = int(valid.sum().item())
+    if count <= 0:
+        return
+
+    out_valid = output.detach()[valid].float()
+    tgt_valid = target.detach()[valid].float()
+
+    stats["count"] += float(count)
+    stats["pred_sum"] += float(out_valid.sum().item())
+    stats["pred_sq_sum"] += float(out_valid.square().sum().item())
+    stats["target_sum"] += float(tgt_valid.sum().item())
+    stats["target_sq_sum"] += float(tgt_valid.square().sum().item())
+
+
+def _finalize_amplitude_stats(stats: dict[str, float]) -> dict[str, float]:
+    """Convert running moments into means/stds with numerical guards."""
+    n = float(stats.get("count", 0.0))
+    if n <= 0:
+        return {
+            "pred_mean": float("nan"),
+            "pred_std": float("nan"),
+            "target_mean": float("nan"),
+            "target_std": float("nan"),
+        }
+
+    pred_mean = stats["pred_sum"] / n
+    target_mean = stats["target_sum"] / n
+
+    pred_var = max(0.0, (stats["pred_sq_sum"] / n) - (pred_mean * pred_mean))
+    target_var = max(0.0, (stats["target_sq_sum"] / n) - (target_mean * target_mean))
+
+    return {
+        "pred_mean": float(pred_mean),
+        "pred_std": float(math.sqrt(pred_var)),
+        "target_mean": float(target_mean),
+        "target_std": float(math.sqrt(target_var)),
+    }
+
+
+def _merge_amplitude_moments(dst: dict[str, float], src: dict[str, float] | None) -> None:
+    """Merge running-moment dictionaries in place."""
+    if not src:
+        return
+    for key in ("count", "pred_sum", "pred_sq_sum", "target_sum", "target_sq_sum"):
+        dst[key] = float(dst.get(key, 0.0)) + float(src.get(key, 0.0))
+
+
+def _compute_mask_breakdown(
+    mask: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[float, float, float, float]:
+    """Decompose masked voxels into three spatial contributors.
+
+    Args:
+        mask:   (B, 1, Z, X, Y) bool — True = preserved voxel.
+        target: (B, 1, Z, X, Y) float — clean seismic (before infill).
+
+    Returns:
+        (total_pct, empty_z_pct, cluster_pct, interpeak_pct)
+
+        All percentages are fractions of all voxels in the batch, and
+        ``empty_z + cluster + interpeak == total`` (up to rounding).
+
+        total_pct:     fraction of all voxels that are masked.
+        empty_z_pct:   masked voxels that lie in empty z-slices.
+        cluster_pct:   masked voxels on fully masked traces with signal,
+                       excluding empty-z voxels.
+        interpeak_pct: remaining masked voxels.
+    """
+    eps = 1e-8
+    mask_bool = mask.to(dtype=torch.bool)
+    masked = ~mask_bool
+    total_pct = masked.float().mean().item() * 100.0
+
+    # (a) Empty z-slices, per-sample, then projected to voxels.
+    # Shape: (B, 1, Z, 1, 1) broadcast over XY.
+    empty_z = target.abs().amax(dim=(1, 3, 4), keepdim=True) < eps
+    empty_z_vox = masked & empty_z
+
+    # (b) Cluster-masked traces: full z-column masked and non-empty signal.
+    # Shapes: (B, 1, 1, X, Y), then broadcast over Z.
+    trace_all_masked = masked.all(dim=2, keepdim=True)
+    trace_has_signal = target.abs().amax(dim=2, keepdim=True) > eps
+    cluster_vox = masked & (~empty_z) & trace_all_masked & trace_has_signal
+
+    # (c) Remaining masked voxels.
+    interpeak_vox = masked & (~empty_z_vox) & (~cluster_vox)
+
+    empty_z_pct = empty_z_vox.float().mean().item() * 100.0
+    cluster_pct = cluster_vox.float().mean().item() * 100.0
+    interpeak_pct = interpeak_vox.float().mean().item() * 100.0
+
+    return total_pct, empty_z_pct, cluster_pct, interpeak_pct
+
+
+def _compute_bounds_based_overlays(
+    input_data: np.ndarray,
+    support_mask: np.ndarray | None = None,
+    base_weight_const: float = 0.333,
+    cluster_weight_const: float = 0.667,
+    cluster_neighbor_scale: float = 0.25,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, int, int, int, int, int] | None]:
+    """Compute bounds-based overlay maps for QC plots.
+
+    If ``support_mask`` is provided, bounds are derived from that mask instead of
+    raw amplitudes, which keeps overlays constrained to valid training support
+    (e.g., excludes augmentation edge regions that may be non-zero but invalid).
+
+    Args:
+        input_data: (z, x, y) volume used for zero-trace detection.
+        support_mask: Optional (z, x, y) boolean mask where True means in-support.
+        base_weight_const: Blue overlay value.
+        cluster_weight_const: Yellow overlay value for core zero-trace columns.
+        cluster_neighbor_scale: Relative weight for XY-adjacent columns after
+            one-step 2x2 dilation. Keeps adjacency visible but fainter so core
+            zero-trace correlation remains obvious.
+
+    Returns:
+        (base_overlay, cluster_overlay, bounds) where overlays have shape
+        (z, x, y), dtype float32.
+    """
+    input_np = input_data.astype(np.float32)
+    D, H, W = input_np.shape
+
+    if support_mask is not None:
+        support = support_mask.astype(bool)
+        if support.shape != input_np.shape:
+            raise ValueError("support_mask must have same shape as input_data")
+    else:
+        support = np.abs(input_np) > 1e-12
+
+    # Helper: find first/last active indices in 1D array
+    def _first_last_positive(arr_1d):
+        idx = np.where(arr_1d > 0)[0]
+        return (int(idx[0]), int(idx[-1])) if idx.size > 0 else None
+
+    # Derive bounds from support mask to avoid non-zero invalid padding areas.
+    z_sum = np.sum(np.sum(support, axis=1), axis=1)  # [z]
+    x_sum = np.sum(np.sum(support, axis=0), axis=1)  # [x]
+    y_sum = np.sum(np.sum(support, axis=0), axis=0)  # [y]
+
+    z_bounds = _first_last_positive(z_sum)
+    x_bounds = _first_last_positive(x_sum)
+    y_bounds = _first_last_positive(y_sum)
+
+    base_overlay = np.zeros((D, H, W), dtype=np.float32)
+    cluster_overlay = np.zeros((D, H, W), dtype=np.float32)
+
+    bounds: tuple[int, int, int, int, int, int] | None = None
+
+    if z_bounds and x_bounds and y_bounds:
+        z_min, z_max = z_bounds
+        x_min, x_max = x_bounds
+        y_min, y_max = y_bounds
+        bounds = (z_min, z_max, x_min, x_max, y_min, y_max)
+
+        # Blue: solid cuboid in bounds
+        base_overlay[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1] = base_weight_const
+
+        # Yellow: zero-amplitude traces (cluster-masked by dataloader) within bounds.
+        # NOTE: do NOT gate by trace_supported here — cluster-masked traces have
+        # support=False for all z (that is what makes them zero), so AND-ing with
+        # trace_supported would silently exclude every cluster trace.
+        bounded_data = input_np[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1]
+        trace_sum_z = np.sum(np.abs(bounded_data), axis=0)  # [x_span, y_span]
+        zero_mask = trace_sum_z <= 1e-12
+
+        # Dilate in 2D XY with full 2x2 neighborhood (includes diagonals).
+        # This matches dataloader/diagnostic adjacency behaviour.
+        expanded_mask = binary_dilation(
+            zero_mask,
+            structure=np.ones((2, 2), dtype=bool),
+            iterations=1,
+        )
+
+        # Keep exact zero-trace columns strong and 2x2 neighbors faint so
+        # visual correlation with masked traces remains interpretable in QC.
+        neighbor_mask = expanded_mask & (~zero_mask)
+
+        # Extrude into 3D: only within blue z-range and bounds.
+        x_span = x_max - x_min + 1
+        y_span = y_max - y_min + 1
+        z_span = z_max - z_min + 1
+        zero_3d = np.broadcast_to(zero_mask[None, :, :], (z_span, x_span, y_span))
+        neighbor_3d = np.broadcast_to(neighbor_mask[None, :, :], (z_span, x_span, y_span))
+        cluster_overlay[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1] = (
+            zero_3d * cluster_weight_const
+            + neighbor_3d * (cluster_weight_const * cluster_neighbor_scale)
+        )
+
+    return base_overlay, cluster_overlay, bounds
+
+
+# Module-level set: records output dirs where the overlay debug dump has been written.
+_overlay_debug_written: set[Path] = set()
+
+
+def _dump_overlay_debug(
+    output_dir: Path,
+    input_np: np.ndarray,
+    support_np: np.ndarray,
+    base_overlay: np.ndarray,
+    cluster_overlay: np.ndarray,
+    bounds: tuple | None,
+    tag: str = "sample",
+) -> None:
+    """Write debug arrays to disk for index-by-index QC verification.
+
+    Saved files under <output_dir>/overlay_debug/<tag>/:
+      input.npy          — (z, x, y) masked input amplitude
+      support_mask.npy   — (z, x, y) bool mask (True=preserved voxel)
+      base_overlay.npy   — (z, x, y) blue overlay values
+      cluster_overlay.npy— (z, x, y) yellow overlay values
+      summary.txt        — human-readable bounds and trace statistics
+    """
+    debug_dir = output_dir / "overlay_debug" / tag
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    np.save(debug_dir / "input.npy", input_np)
+    np.save(debug_dir / "support_mask.npy", support_np)
+    np.save(debug_dir / "base_overlay.npy", base_overlay)
+    np.save(debug_dir / "cluster_overlay.npy", cluster_overlay)
+
+    with open(debug_dir / "summary.txt", "w") as f:
+        f.write(f"Input shape: {input_np.shape}\n")
+        f.write(f"Support True fraction: {support_np.mean():.4f}\n")
+        if bounds is not None:
+            z_min, z_max, x_min, x_max, y_min, y_max = bounds
+            f.write(f"Bounds: z=[{z_min},{z_max}], x=[{x_min},{x_max}], y=[{y_min},{y_max}]\n")
+            bounded_inp = input_np[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1]
+            bounded_supp = support_np[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1]
+            trace_sum = np.sum(np.abs(bounded_inp), axis=0)
+            trace_supported_any = np.any(bounded_supp, axis=0)
+            zero_amp = trace_sum <= 1e-12
+            cluster_xy = (cluster_overlay[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1] > 0).any(axis=0)
+            overlap = zero_amp & cluster_xy
+            f.write(f"Bounded region shape: {bounded_inp.shape}\n")
+            f.write(f"Total traces in bounds: {trace_sum.size}\n")
+            f.write(f"Zero-amplitude traces (cluster-masked): {zero_amp.sum()}\n")
+            f.write(f"Cluster overlay traces (any weight): {cluster_xy.sum()}\n")
+            f.write(f"Zero->cluster recall: {overlap.sum() / max(zero_amp.sum(), 1):.4f}\n")
+            f.write(f"Cluster precision wrt zero: {overlap.sum() / max(cluster_xy.sum(), 1):.4f}\n")
+            f.write(f"Supported traces (any True in support): {trace_supported_any.sum()}\n")
+            f.write(f"Zero & supported: {(zero_amp & trace_supported_any).sum()}\n")
+            f.write(f"Zero & NOT supported: {(zero_amp & ~trace_supported_any).sum()}\n")
+
+            cluster_max = float(np.max(cluster_overlay))
+            if cluster_max > 0:
+                core_xy = (
+                    cluster_overlay[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1] >= (0.95 * cluster_max)
+                ).any(axis=0)
+                f.write(f"Cluster core traces (near max weight): {core_xy.sum()}\n")
+        else:
+            f.write("Bounds: None (degenerate input)\n")
+        f.write(f"Base overlay nonzero voxels: {(base_overlay > 0).sum()}\n")
+        f.write(f"Cluster overlay nonzero voxels: {(cluster_overlay > 0).sum()}\n")
+        cx = input_np.shape[1] // 2
+        cy = input_np.shape[2] // 2
+        f.write(f"Center cross-sections: x={cx}, y={cy}\n")
+        f.write(f"  cluster_overlay[:, cx, :].max()={cluster_overlay[:, cx, :].max():.4f}\n")
+        f.write(f"  cluster_overlay[:, :, cy].max()={cluster_overlay[:, :, cy].max():.4f}\n")
+        # Show which Y-positions at center-x have cluster overlay
+        cluster_y_profile = (cluster_overlay[:, cx, :] > 0).any(axis=0)
+        active_y = np.where(cluster_y_profile)[0].tolist()
+        f.write(f"  Y indices with cluster overlay at center-x: {active_y[:30]}{'...' if len(active_y) > 30 else ''}\n")
+        # Compare to zero-amplitude trace positions at center-x
+        if bounds is not None:
+            z_min, z_max, x_min, x_max, y_min, y_max = bounds
+            bounded_inp = input_np[z_min:z_max+1, x_min:x_max+1, y_min:y_max+1]
+            trace_sum = np.sum(np.abs(bounded_inp), axis=0)
+            zero_at_cx = np.where(trace_sum[cx - x_min, :] <= 1e-12)[0] + y_min
+            f.write(f"  Y indices of zero-amp traces at x={cx}: {zero_at_cx.tolist()[:30]}\n")
+
+    print(f"    [overlay_debug] arrays written to {debug_dir}/")
 
 
 class ThermalGuard:
@@ -607,6 +949,9 @@ def _log_per_dataset_figures(
     writer: SummaryWriter,
     epoch: int,
     epoch_loss: float,
+    criterion: nn.Module | None = None,
+    output_dir: Path | None = None,
+    fixed_amplitude_range: tuple[float, float] | None = None,
 ) -> None:
     """Log one 4-panel cross-section figure per source dataset to TensorBoard.
 
@@ -649,10 +994,29 @@ def _log_per_dataset_figures(
                         stacklevel=2,
                     )
                     break
-                sample_ds, inp, tgt, _ = sample
+                sample_ds, inp, tgt, mask = sample
                 inp_t = torch.from_numpy(inp).unsqueeze(0).unsqueeze(0).float().to(device)
                 out_t = model(inp_t)
                 tgt_t = torch.from_numpy(tgt).unsqueeze(0)
+                mask_t = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0)
+                base_weight_map = None
+                cluster_weight_map = None
+                # Use bounds+adjacency overlay logic (matches diagnostic script)
+                inp_np = inp.astype(np.float32)  # inp is already (z, x, y) from dataloader
+                support_np = mask.astype(bool)   # dataset mask in (z, x, y)
+                base_overlay, cluster_overlay, bounds = _compute_bounds_based_overlays(
+                    inp_np,
+                    support_mask=support_np,
+                    base_weight_const=0.333,
+                    cluster_weight_const=0.667,
+                )
+                # One-shot debug dump on first epoch for index-by-index verification
+                if output_dir is not None and output_dir not in _overlay_debug_written:
+                    _dump_overlay_debug(output_dir, inp_np, support_np, base_overlay, cluster_overlay, bounds, tag=ds_name)
+                    _overlay_debug_written.add(output_dir)
+                # Convert to torch tensors matching tensorboard figure format [C, D, H, W]
+                base_weight_map = torch.from_numpy(base_overlay).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
+                cluster_weight_map = torch.from_numpy(cluster_overlay).unsqueeze(0).unsqueeze(0)  # [1, 1, D, H, W]
                 sample_ds_name = Path(sample_ds.data_path).parent.name
                 title = (
                     f"{ds_name}  |  epoch {epoch + 1}  |  loss {epoch_loss:.4f}"
@@ -660,7 +1024,13 @@ def _log_per_dataset_figures(
                 if sample_ds is not ds:
                     title = f"{title}  |  example from {sample_ds_name}"
                 fig = make_4panel_figure(
-                    inp_t[0].cpu(), out_t[0].cpu(), tgt_t.cpu(), title
+                    inp_t[0].cpu(),
+                    out_t[0].cpu(),
+                    tgt_t.cpu(),
+                    title,
+                    base_weight_vol=base_weight_map[0].cpu() if base_weight_map is not None else None,
+                    cluster_weight_vol=cluster_weight_map[0].cpu() if cluster_weight_map is not None else None,
+                    fixed_amplitude_range=fixed_amplitude_range,
                 )
                 writer.add_figure(f"train/{ds_name}", fig, global_step=epoch + 1)
                 plt.close(fig)
@@ -673,6 +1043,10 @@ def train_epoch(
     train_loader: DataLoader,
     optimizer: optim.Optimizer,
     criterion: nn.Module,
+    mse_fn: nn.Module,
+    huber_fn: nn.Module,
+    ssim_fn: nn.Module,
+    loss_type: str,
     device: torch.device,
     scaler=None,
     writer: SummaryWriter = None,
@@ -687,6 +1061,7 @@ def train_epoch(
     ema_update_every: int = 1,
     max_batches: int | None = None,
     return_details: bool = False,
+    fixed_amplitude_range: tuple[float, float] | None = None,
 ) -> float | dict:
     """
     Train for one epoch using a single merged train DataLoader.
@@ -704,10 +1079,16 @@ def train_epoch(
     optimizer.zero_grad(set_to_none=True)
 
     window_start = time.monotonic()
-    nz_pct_sum = 0.0
+    masked_pct_sum = 0.0
+    empty_z_pct_sum = 0.0
+    cluster_pct_sum = 0.0
+    interpeak_pct_sum = 0.0
     last_input = None
     last_output = None
     last_target = None
+    last_base_weight_map = None
+    last_cluster_weight_map = None
+    amplitude_stats = _new_amplitude_stats()
 
     try:
         natural_batches = len(train_loader)
@@ -722,6 +1103,8 @@ def train_epoch(
                 "loss": avg_loss,
                 "batches_processed": 0,
                 "reload_requested": False,
+                "amplitude_stats": _finalize_amplitude_stats(amplitude_stats),
+                "amplitude_moments": amplitude_stats,
             }
         return avg_loss
 
@@ -730,8 +1113,11 @@ def train_epoch(
     loader_iter = iter(train_loader)
     iter_elapsed_min = (time.monotonic() - iter_start_t0) / 60.0
     print(f"    Train iterator/sampler startup: {iter_elapsed_min:04.1f}m")
+    data_wait_sum_s = 0.0
+    compute_sum_s = 0.0
     reload_requested = False
     for batch_idx in range(target_batches):
+        data_t0 = time.monotonic()
         try:
             input_data, target, mask = next(loader_iter)
             input_data = input_data.unsqueeze(1).float().to(device, non_blocking=True)
@@ -752,19 +1138,38 @@ def train_epoch(
             print(f"    WARNING: skipping batch {batch_idx} — {e}")
             reload_requested = True
             break
+        data_wait_sum_s += time.monotonic() - data_t0
 
+        compute_t0 = time.monotonic()
         try:
             with autocast_context(device):
                 output = model(input_data)
 
             # Compute losses in FP32 for numeric stability on MPS autocast.
             # SSIM has multiple reductions/divisions and is more sensitive than MSE.
-            loss = _compute_masked_loss(
+            mse_loss, huber_loss, ssim_loss = _compute_study_scaled_losses(
                 criterion,
+                mse_fn,
+                huber_fn,
+                ssim_fn,
                 output.float(),
                 target.float(),
                 mask,
             )
+
+            ### TODO: remove block ----------- qc for batch -------------- start
+            # QC block: report the already-scaled study losses so runtime logs make
+            # the effective weighting explicit (SSIM is shown after the 200x scale).
+            print(
+                f"         .. Batch {batch_idx + 1}/{target_batches}: \n"
+                f"          . mse={mse_loss.item():.6f}, huber={huber_loss.item():.6f}, ssim(x200)={ssim_loss.item():.6f}\n"
+                f"          . input  min/mean/max/std: {input_data.min().item():.3f}/{input_data.mean().item():.3f}/{input_data.max().item():.3f}/{input_data.std().item():.3f}\n"
+                f"          . output min/mean/max/std: {output.min().item():.3f}/{output.mean().item():.3f}/{output.max().item():.3f}/{output.std().item():.3f}\n"
+                f"          . target min/mean/max/std: {target.min().item():.3f}/{target.mean().item():.3f}/{target.max().item():.3f}/{target.std().item():.3f}\n"
+            )
+            ### TODO: remove block ----------- qc for batch -------------- end
+
+            loss = _select_loss_by_type(loss_type, mse_loss, huber_loss, ssim_loss)
             if not torch.isfinite(loss):
                 print(f"    WARNING: non-finite loss at train batch {batch_idx}; skipping this batch.")
                 optimizer.zero_grad(set_to_none=True)
@@ -812,6 +1217,7 @@ def train_epoch(
                     torch.mps.empty_cache()
                 continue
             raise
+        compute_sum_s += time.monotonic() - compute_t0
 
         temp_c = None
         if thermal_guard is not None:
@@ -834,19 +1240,60 @@ def train_epoch(
         total_loss += batch_loss
         total_batches += 1
 
+        batch_size = int(input_data.shape[0])
+        for sample_idx in range(batch_size):
+            print(
+                f"         .. Trained example: epoch={epoch + 1}, "
+                f"batch={batch_idx + 1}/{target_batches}, "
+                f"sample={sample_idx + 1}/{batch_size}"
+            )
+
         with torch.no_grad():
-            x_nz = (input_data != 0).sum().item()
-            y_nz = (target != 0).sum().item()
-            batch_pct = (x_nz / y_nz * 100.0) if y_nz > 0 else 0.0
-        nz_pct_sum += batch_pct
+            # Coverage metric should be independent of fill strategy (zero/gaussian).
+            # mask=True means preserve; mask=False means masked.
+            batch_pct, b_empty_z, b_cluster, b_interpeak = _compute_mask_breakdown(mask, target)
+            _accumulate_amplitude_stats(amplitude_stats, output, target, mask)
+        masked_pct_sum += batch_pct
+        empty_z_pct_sum += b_empty_z
+        cluster_pct_sum += b_cluster
+        interpeak_pct_sum += b_interpeak
 
         # Keep last batch tensors for end-of-epoch diagnostic plotting.
         last_input = input_data[0].detach().cpu()
         last_output = output[0].detach().cpu()
         last_target = target[0].detach().cpu()
+        last_base_weight_map = None
+        last_cluster_weight_map = None
+        # Use bounds+adjacency overlay logic (matches diagnostic script)
+        # input_data[0] has shape [1, D, H, W] (batch already indexed, channel remains)
+        # Extract [D, H, W] and convert to numpy for overlay computation
+        last_input_np = last_input[0].numpy().astype(np.float32)  # Remove channel dim, convert to numpy
+        last_support_np = mask[0, 0].detach().cpu().numpy().astype(bool)
+        base_overlay, cluster_overlay, _last_bounds = _compute_bounds_based_overlays(
+            last_input_np,
+            support_mask=last_support_np,
+            base_weight_const=0.333,
+            cluster_weight_const=0.667,
+        )
+        # Convert back to torch for consistency with tensorboard figure format
+        last_base_weight_map = torch.from_numpy(base_overlay)
+        last_cluster_weight_map = torch.from_numpy(cluster_overlay)
 
         if (batch_idx + 1) % 10 == 0:
-            avg_pct = nz_pct_sum / max(total_batches, 1)
+            n = max(total_batches, 1)
+            avg_pct = masked_pct_sum / n
+            avg_empty_z = empty_z_pct_sum / n
+            avg_cluster = cluster_pct_sum / n
+            avg_interpeak = interpeak_pct_sum / n
+            avg_data_s = data_wait_sum_s / n
+            avg_compute_s = compute_sum_s / n
+            batch_size = max(int(input_data.shape[0]), 1)
+            avg_data_s_per_example = avg_data_s / batch_size
+            avg_compute_s_per_example = avg_compute_s / batch_size
+            avg_data_ms = avg_data_s_per_example * 1000.0
+            avg_compute_ms = avg_compute_s_per_example * 1000.0
+            denom = max(avg_data_ms + avg_compute_ms, 1e-6)
+            data_share_pct = 100.0 * avg_data_ms / denom
             elapsed_dhm = _format_elapsed_dhm(window_start)
             window_start = time.monotonic()
             temp_str = ""
@@ -856,7 +1303,11 @@ def train_epoch(
                 temp_str = f", Thermal pressure: {thermal_guard.last_pressure_level}"
             print(
                 f"    Train batch {batch_idx}/{target_batches}, Elapsed DHM: {elapsed_dhm}, "
-                f"Loss: {batch_loss:.4f}, Augmentation non-zero percentage: {avg_pct:.1f}%{temp_str}"
+                f"Loss: {batch_loss:.4f}{temp_str}\n"
+                f"       .. Timing(avg per example): data={_format_seconds_compact(avg_data_s_per_example)}, "
+                f"compute={_format_seconds_compact(avg_compute_s_per_example)}, data_share={data_share_pct:.0f}%\n"
+                f"       .. Masked: {avg_pct:.1f}% total "
+                f"(empty-z: {avg_empty_z:.1f}%, cluster-traces: {avg_cluster:.1f}%, inter-peak: {avg_interpeak:.1f}%)"
             )
             if output_dir is not None:
                 _save_checkpoint(
@@ -871,16 +1322,27 @@ def train_epoch(
     if writer is not None and last_input is not None:
         avg_epoch_loss = total_loss / max(total_batches, 1)
         title = f"merged-train  |  epoch {epoch + 1}  |  loss {avg_epoch_loss:.4f}"
-        fig = make_4panel_figure(last_input, last_output, last_target, title)
+        fig = make_4panel_figure(
+            last_input,
+            last_output,
+            last_target,
+            title,
+            base_weight_vol=last_base_weight_map,
+            cluster_weight_vol=last_cluster_weight_map,
+            fixed_amplitude_range=fixed_amplitude_range,
+        )
         writer.add_figure("train/merged", fig, global_step=epoch + 1)
         plt.close(fig)
 
     avg_loss = total_loss / max(total_batches, 1)
+    amp = _finalize_amplitude_stats(amplitude_stats)
     if return_details:
         return {
             "loss": avg_loss,
             "batches_processed": total_batches,
             "reload_requested": reload_requested,
+            "amplitude_stats": amp,
+            "amplitude_moments": amplitude_stats,
         }
     return avg_loss
 
@@ -889,12 +1351,18 @@ def validate(
     model: nn.Module,
     val_loaders: list,
     criterion: nn.Module,
+    mse_fn: nn.Module,
+    huber_fn: nn.Module,
+    ssim_fn: nn.Module,
+    loss_type: str,
     device: torch.device,
     writer: SummaryWriter = None,
     epoch: int = 0,
     thermal_guard: ThermalGuard = None,
     max_batches: int | None = None,
-) -> float:
+    fixed_amplitude_range: tuple[float, float] | None = None,
+    return_details: bool = False,
+) -> float | dict:
     """
     Validate the model across all validation datasets.
 
@@ -903,11 +1371,18 @@ def validate(
     select tag prefixes to toggle between input/output for each slice direction.
     """
     if not val_loaders:
+        if return_details:
+            return {
+                "loss": float("nan"),
+                "batches_processed": 0,
+                "amplitude_stats": _finalize_amplitude_stats(_new_amplitude_stats()),
+            }
         return float('nan')
 
     model.eval()
     total_loss = 0.0
     total_batches = 0
+    amplitude_stats = _new_amplitude_stats()
     val_start = time.monotonic()
     window_start = val_start
     remaining_batches = None if max_batches is None else max(1, int(max_batches))
@@ -946,7 +1421,10 @@ def validate(
             first_target = None
             ds_loss = 0.0
             ds_batches = 0
-            ds_nonzero_pct_sum = 0.0
+            ds_masked_pct_sum = 0.0
+            ds_empty_z_pct_sum = 0.0
+            ds_cluster_pct_sum = 0.0
+            ds_interpeak_pct_sum = 0.0
 
             try:
                 loader_iter = iter(loader)
@@ -962,12 +1440,16 @@ def validate(
                     with autocast_context(device):
                         output = model(input_data)
 
-                    loss = _compute_masked_loss(
+                    mse_loss, huber_loss, ssim_loss = _compute_study_scaled_losses(
                         criterion,
+                        mse_fn,
+                        huber_fn,
+                        ssim_fn,
                         output.float(),
                         target.float(),
                         mask,
                     )
+                    loss = _select_loss_by_type(loss_type, mse_loss, huber_loss, ssim_loss)
                     if not torch.isfinite(loss):
                         print(f"    WARNING: non-finite val loss in {ds_name} batch {batch_idx}; skipping batch.")
                         continue
@@ -981,11 +1463,13 @@ def validate(
                     total_loss += batch_loss
                     total_batches += 1
 
-                    # Track non-zero ratio
-                    x_nz = (input_data != 0).sum().item()
-                    y_nz = (target != 0).sum().item()
-                    batch_pct = (x_nz / y_nz * 100.0) if y_nz > 0 else 0.0
-                    ds_nonzero_pct_sum += batch_pct
+                    # Track masked coverage ratio independent of fill strategy.
+                    batch_pct, b_empty_z, b_cluster, b_interpeak = _compute_mask_breakdown(mask, target)
+                    _accumulate_amplitude_stats(amplitude_stats, output, target, mask)
+                    ds_masked_pct_sum += batch_pct
+                    ds_empty_z_pct_sum += b_empty_z
+                    ds_cluster_pct_sum += b_cluster
+                    ds_interpeak_pct_sum += b_interpeak
 
                     # Capture first batch only for plotting
                     if first_input is None:
@@ -994,7 +1478,11 @@ def validate(
                         first_target = target[0].detach().cpu()
 
                     if (batch_idx + 1) % 10 == 0:
-                        avg_pct = ds_nonzero_pct_sum / ds_batches
+                        n = max(ds_batches, 1)
+                        avg_pct = ds_masked_pct_sum / n
+                        avg_empty_z = ds_empty_z_pct_sum / n
+                        avg_cluster = ds_cluster_pct_sum / n
+                        avg_interpeak = ds_interpeak_pct_sum / n
                         elapsed_dhm = _format_elapsed_dhm(window_start)
                         window_start = time.monotonic()
                         temp_str = ""
@@ -1004,7 +1492,10 @@ def validate(
                             temp_str = f", Thermal pressure: {thermal_guard.last_pressure_level}"
                         print(
                             f"    Val batch {batch_idx}/{target_ds_batches}, Elapsed DHM: {elapsed_dhm}, "
-                            f"Loss: {batch_loss:.4f}, Augmentation non-zero percentage: {avg_pct:.1f}%{temp_str}"
+                            f"Loss: {batch_loss:.4f}, "
+                            f"Masked: {avg_pct:.1f}% total "
+                            f"(empty-z: {avg_empty_z:.1f}%, cluster-traces: {avg_cluster:.1f}%, inter-peak: {avg_interpeak:.1f}%)"
+                            f"{temp_str}"
                         )
             except Exception as e:
                 print(f"    WARNING: val dataset {ds_name} failed mid-epoch — {e}")
@@ -1020,7 +1511,12 @@ def validate(
                 for axis in ("x", "y"):
                     for kind, vol in (("input", first_input), ("output", first_output), ("label", first_target)):
                         title = f"{title_base}  |  center-{axis.upper()}  |  {kind}"
-                        fig = make_crosssection_figure(vol, title, axis=axis)
+                        fig = make_crosssection_figure(
+                            vol,
+                            title,
+                            axis=axis,
+                            fixed_amplitude_range=fixed_amplitude_range,
+                        )
                         # Tag path: val_centerX/input/dataset_name
                         #           val_centerX/output/dataset_name
                         # TensorBoard groups these under val_centerX so you
@@ -1029,7 +1525,15 @@ def validate(
                         writer.add_figure(tag, fig, global_step=epoch + 1)
                         plt.close(fig)
 
-    return total_loss / max(total_batches, 1)
+    avg_loss = total_loss / max(total_batches, 1)
+    amp = _finalize_amplitude_stats(amplitude_stats)
+    if return_details:
+        return {
+            "loss": avg_loss,
+            "batches_processed": total_batches,
+            "amplitude_stats": amp,
+        }
+    return avg_loss
 
 
 DEFAULT_ARRAY_KEYS = [
@@ -1043,7 +1547,7 @@ DEFAULT_ARRAY_KEYS = [
     # "seismicCubes_cumsum_29_degrees_normalized_augmented",
     # "seismicCubes_cumsum_5_degrees_normalized_augmented",
     "seismicCubes_cumsum_fullstack",
-    "seismicCubes_cumsum_fullstack_noise_free"
+    # "seismicCubes_cumsum_fullstack_noise_free"
 ]
 
 
@@ -1069,12 +1573,22 @@ def _extract_compat_cli_overrides(argv):
         "--ssim-alpha": "ssim_alpha",
         "--ssim_min_valid_ratio": "ssim_min_valid_ratio",
         "--ssim-min-valid-ratio": "ssim_min_valid_ratio",
+        "--ssim_implementation": "ssim_implementation",
+        "--ssim-implementation": "ssim_implementation",
         "--target_masked_fraction": "target_masked_fraction",
         "--target-masked-fraction": "target_masked_fraction",
         "--cluster_shape": "cluster_shape",
         "--cluster-shape": "cluster_shape",
         "--center_selection_method": "center_selection_method",
         "--center-selection-method": "center_selection_method",
+        "--mask_fill_method": "mask_fill_method",
+        "--mask-fill-method": "mask_fill_method",
+        "--mask_noise_std": "mask_noise_std",
+        "--mask-noise-std": "mask_noise_std",
+        "--block_type": "block_type",
+        "--block-type": "block_type",
+        "--pre_head_mode": "pre_head_mode",
+        "--pre-head-mode": "pre_head_mode",
         "--cluster_kernel_size": "cluster_kernel_size",
         "--cluster-kernel-size": "cluster_kernel_size",
         "--cluster_eps": "cluster_eps",
@@ -1123,9 +1637,14 @@ def _apply_compat_cli_overrides(args, overrides):
         "ssim_data_range": float,
         "ssim_alpha": float,
         "ssim_min_valid_ratio": float,
+        "ssim_implementation": str,
         "target_masked_fraction": float,
         "cluster_shape": int,
         "center_selection_method": str,
+        "mask_fill_method": str,
+        "mask_noise_std": float,
+        "block_type": str,
+        "pre_head_mode": str,
         "enable_cluster_loss": bool,
         "cluster_kernel_size": int,
         "cluster_eps": float,
@@ -1177,6 +1696,17 @@ def main():
                        help="Blend factor in [0,1] for mixed SSIM+MSE loss; 0=MSE, 1=SSIM (default: 1/6)")
     parser.add_argument("--ssim_min_valid_ratio", "--ssim-min-valid-ratio", dest="ssim_min_valid_ratio", type=float, default=0.5,
                        help="Minimum local valid-mask support ratio for SSIM pooling in [0,1] (default: 0.5)")
+    parser.add_argument(
+        "--ssim_implementation", "--ssim-implementation",
+        dest="ssim_implementation",
+        type=str,
+        default="custom",
+        choices=["custom", "monai"],
+        help=(
+            "SSIM implementation for --loss_type=ssim_mse: "
+            "custom (zero-mean seismic-specialized) or monai (standard local-mean SSIM)."
+        ),
+    )
     parser.add_argument(
         "--enable-cluster-loss", "--enable_cluster_loss",
         dest="enable_cluster_loss",
@@ -1235,6 +1765,43 @@ def main():
                        help="Update EMA every N optimizer steps (default: 1)")
     parser.add_argument("--sample_shape", type=int, nargs=3, default=[128, 128, 128],
                        help="Sample shape (x y z)")
+    parser.add_argument(
+        "--amplitude_transform",
+        type=str,
+        default="example_stdev_scaling",
+        choices=[
+            "example_stdev_scaling",
+            "dataset_quantile_scaling",
+            "histogram_equalization",
+            "standardize",
+            "quantile_normal",
+        ],
+        help=(
+            "Amplitude preprocessing mode: "
+            "example_stdev_scaling (per-example std scaling to target stdev), "
+            "dataset_quantile_scaling (derive/load per-zarr-key quantile->normal mapping from the full 3D array), or "
+            "histogram_equalization (joint histeq across all seismic keys, ported from synthoseis)"
+        ),
+    )
+    parser.add_argument(
+        "--quantile_symmetry_mode",
+        type=str,
+        default="strict_odd",
+        choices=["strict_odd", "independent"],
+        help="Quantile-normal symmetry mode (default: strict_odd)",
+    )
+    parser.add_argument(
+        "--quantile_epsilon",
+        type=float,
+        default=1e-6,
+        help="Epsilon for quantile->normal mapping (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--transforms_group",
+        type=str,
+        default="transforms",
+        help="Zarr subgroup used for persisted transforms (default: transforms)",
+    )
     # NOTE: legacy `trace_mask_ratio` removed; use --target_masked_fraction instead
     parser.add_argument("--target_masked_fraction", "--target-masked-fraction", dest="target_masked_fraction", type=float, default=0.15,
                        help="Target final masked fraction after cluster size/probability effects (default: 0.15)")
@@ -1243,12 +1810,28 @@ def main():
     parser.add_argument("--center_selection_method", "--center-selection-method", dest="center_selection_method", type=str, default="random_mixture",
                        choices=["random_mixture", "mitchell_best_candidate", "poisson_disc", "uniform_random"],
                        help="Cluster-center sampling method for masking (default: random_mixture)")
+    parser.add_argument("--mask_fill_method", "--mask-fill-method", dest="mask_fill_method", type=str, default="zero",
+                       choices=["zero", "gaussian"],
+                       help="Masked-voxel infill method (default: zero)")
+    parser.add_argument("--mask_noise_std", "--mask-noise-std", dest="mask_noise_std", type=float, default=1e-2,
+                       help="Std-dev for Gaussian mask infill when --mask_fill_method=gaussian (default: 1e-2)")
     parser.add_argument("--device", type=str, default="auto",
                        help="Device (auto, cuda, mps, cpu)")
     parser.add_argument("--resume", type=str, default=None,
                        help="Resume from checkpoint")
     parser.add_argument("--use_mamba", action="store_true",
                        help="Use U-Mamba hybrid blocks in encoder (requires CUDA + mamba_ssm; falls back to ResBlock3d on MPS/CPU)")
+    parser.add_argument("--block_type", "--block-type", dest="block_type", type=str, default="resblock",
+                       choices=["resblock", "anisotropic"],
+                       help="Residual block family for encoder/decoder convolutional stages (default: resblock)")
+    parser.add_argument(
+        "--pre_head_mode", "--pre-head-mode",
+        dest="pre_head_mode",
+        type=str,
+        default="norm_gelu",
+        choices=["identity", "norm", "norm_gelu"],
+        help="Pre-head projection before final output head: identity|norm|norm_gelu (default: norm_gelu)",
+    )
     parser.add_argument("--thermal_max_c", type=float, default=85.0,
                        help="Pause when CPU temperature exceeds this in Celsius; set <=0 to disable")
     parser.add_argument("--thermal_cooldown_sec", type=int, default=300,
@@ -1264,10 +1847,29 @@ def main():
                        help="Monitor sampling interval in seconds (default: 300)")
     parser.add_argument("--monitor_csv_path", type=str, default=None,
                        help="CSV output path for monitor rows (default: cpu_mem_stats_<pid>.csv)")
+    # in your argparse setup
+    parser.add_argument(
+        "--model-arch",
+        type=str,
+        default="unet",
+        choices=["unet", "dynunet"],
+        help="Backbone architecture: 'unet' (SeismicUNet3d) or 'dynunet' (DynSeismicUNet3d).",
+    )
 
     argv_for_argparse, compat_overrides = _extract_compat_cli_overrides(sys.argv[1:])
     args = parser.parse_args(argv_for_argparse)
     _apply_compat_cli_overrides(args, compat_overrides)
+
+    if args.amplitude_transform == "standardize":
+        parser.error(
+            "--amplitude_transform=standardize was renamed to "
+            "example_stdev_scaling. Use: --amplitude_transform example_stdev_scaling"
+        )
+    if args.amplitude_transform == "quantile_normal":
+        parser.error(
+            "--amplitude_transform=quantile_normal was renamed to "
+            "dataset_quantile_scaling. Use: --amplitude_transform dataset_quantile_scaling"
+        )
 
     if not (0.0 < args.val_split_ratio < 1.0):
         parser.error("--val_split_ratio must be between 0 and 1 (exclusive)")
@@ -1281,8 +1883,12 @@ def main():
         parser.error("--monitor_interval_sec must be > 0")
     if not (0.0 <= args.target_masked_fraction <= 1.0):
         parser.error("--target_masked_fraction must be between 0 and 1")
+    if not (0.0 < args.quantile_epsilon < 0.5):
+        parser.error("--quantile_epsilon must be in (0, 0.5)")
     if args.cluster_shape <= 0 or args.cluster_shape % 2 == 0:
         parser.error("--cluster_shape must be a positive odd integer")
+    if args.mask_noise_std < 0:
+        parser.error("--mask_noise_std must be >= 0")
     if args.huber_delta <= 0:
         parser.error("--huber_delta must be > 0")
     if args.ssim_window_size < 3:
@@ -1402,12 +2008,45 @@ def main():
     print("Creating model...")
     if args.use_mamba and not _MAMBA_AVAILABLE:
         print("WARNING: --use_mamba requested but mamba_ssm not installed; falling back to ResBlock3d")
-    model = create_model(
-        use_mamba=args.use_mamba,
-        input_channels=1,
-        hidden_dims=(32, 64, 128, 256),
-        spatial_size=tuple(args.sample_shape),
-    ).to(device)
+    # model = create_model(
+    #     use_mamba=args.use_mamba,
+    #     block_type=args.block_type,
+    #     input_channels=1,
+    #     hidden_dims=(32, 64, 128, 256),
+    #     spatial_size=tuple(args.sample_shape),
+    # ).to(device)
+
+    # Use the same backbone for both static and dynamic UNet variants to keep the parameter count and memory profile comparable for this diagnostic.  The dynamic UNet will add some additional overhead in the attention blocks, but the bulk of the memory usage is in activations which should be similar.
+    # - Note: create_dyn_model was written in an MS-Edge browser-based copilot session
+    model_hidden_dims = (32, 64, 128, 256)
+    model_input_channels = 1
+    model_spatial_size = tuple(args.sample_shape)
+    model_spacing = (1.0, 1.0, 1.0)
+
+    if args.model_arch == "unet":
+        model = create_static_model(
+            use_mamba=args.use_mamba,
+            block_type=args.block_type,
+            use_checkpoint=True,
+            input_channels=model_input_channels,
+            hidden_dims=model_hidden_dims,
+            spatial_size=model_spatial_size,
+            pre_head_mode=args.pre_head_mode,
+        )
+    elif args.model_arch == "dynunet":
+        model = create_dyn_model(
+            use_mamba=args.use_mamba,
+            block_type=args.block_type,
+            use_checkpoint=True,
+            input_channels=model_input_channels,
+            spatial_size=model_spatial_size,
+            spacing=model_spacing,
+            pre_head_mode=args.pre_head_mode,
+        )
+    else:
+        raise ValueError(f"Unsupported model architecture: {args.model_arch}")
+
+    model = model.to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
@@ -1502,28 +2141,72 @@ def main():
         pin_memory=(device.type == "cuda"),
         normalize=True,
         target_std=1.0,
+        amplitude_transform=args.amplitude_transform,
+        quantile_symmetry_mode=args.quantile_symmetry_mode,
+        quantile_epsilon=args.quantile_epsilon,
+        transforms_group=args.transforms_group,
         target_masked_fraction=args.target_masked_fraction,
         cluster_shape=args.cluster_shape,
         center_selection_method=args.center_selection_method,
+        mask_fill_method=args.mask_fill_method,
+        mask_noise_std=args.mask_noise_std,
+        enable_cluster_mask_expansion=bool(args.enable_cluster_loss),
         array_keys=args.array_keys,
+    )
+    tensorboard_fixed_amplitude_range = None
+    if args.amplitude_transform in ("dataset_quantile_scaling", "quantile_normal", "histogram_equalization"):
+        tensorboard_fixed_amplitude_range = (-3.0, 3.0)
+    print(
+        f"Cluster mask expansion: "
+        f"{'ON' if loader_kwargs['enable_cluster_mask_expansion'] else 'OFF'}"
     )
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    mse_fn = nn.MSELoss(reduction="mean").to(device)
+    huber_fn = nn.HuberLoss(delta=float(args.huber_delta), reduction="mean").to(device)
+    if args.ssim_implementation == "custom":
+        ssim_fn = SSIMMSELoss3D(
+            data_range=float(args.ssim_data_range),
+            window_size=int(args.ssim_window_size),
+            sigma=float(args.ssim_sigma),
+            alpha=float(args.ssim_alpha),
+            min_valid_ratio=float(args.ssim_min_valid_ratio),
+        ).to(device)
+    else:
+        ssim_fn = MONAIStyleSSIMMSELoss3D(
+            data_range=float(args.ssim_data_range),
+            win_size=int(args.ssim_window_size),
+            k1=0.01,
+            k2=0.03,
+            alpha=float(args.ssim_alpha),
+            min_valid_ratio=float(args.ssim_min_valid_ratio),
+        ).to(device)
+
     if args.loss_type == "huber":
         criterion = nn.HuberLoss(delta=args.huber_delta, reduction="mean")
     elif args.loss_type == "ssim_mse":
-        criterion = SSIMMSELoss3D(
-            data_range=args.ssim_data_range,
-            window_size=args.ssim_window_size,
-            sigma=args.ssim_sigma,
-            alpha=args.ssim_alpha,
-            min_valid_ratio=args.ssim_min_valid_ratio,
-        ).to(device)
+        if args.ssim_implementation == "custom":
+            criterion = SSIMMSELoss3D(
+                data_range=args.ssim_data_range,
+                window_size=args.ssim_window_size,
+                sigma=args.ssim_sigma,
+                alpha=args.ssim_alpha,
+                min_valid_ratio=args.ssim_min_valid_ratio,
+            ).to(device)
+        else:
+            criterion = MONAIStyleSSIMMSELoss3D(
+                data_range=args.ssim_data_range,
+                win_size=args.ssim_window_size,
+                k1=0.01,
+                k2=0.03,
+                alpha=args.ssim_alpha,
+                min_valid_ratio=args.ssim_min_valid_ratio,
+            ).to(device)
     else:
         criterion = nn.MSELoss()
     # Optionally wrap SSIM-MSE criterion in the composite cluster-aware loss.
     if args.enable_cluster_loss:
-        if isinstance(criterion, SSIMMSELoss3D):
+        if isinstance(criterion, (SSIMMSELoss3D, MONAIStyleSSIMMSELoss3D)):
             criterion = CompositeClusterAwareLoss(
                 base_criterion=criterion,
                 kernel_size=args.cluster_kernel_size,
@@ -1562,7 +2245,7 @@ def main():
     tb_log_dir = output_dir / "runs"
     writer = SummaryWriter(log_dir=str(tb_log_dir))
     print(f"TensorBoard logs: {tb_log_dir}")
-    print("  Launch viewer: tensorboard --logdir checkpoints/runs")
+    print(f"  Launch viewer: uv run tensorboard --logdir {tb_log_dir}")
 
     monitor = None
     if not args.monitor_disabled:
@@ -1615,22 +2298,43 @@ def main():
         )
     if args.loss_type == "huber":
         print(f"Loss: Huber (delta={args.huber_delta})")
+        print("Loss formula: total = Huber(pred, target) over supervised voxels")
     elif args.loss_type == "ssim_mse":
-        print(
-            "Loss: SSIM-MSE "
-            f"(window={args.ssim_window_size}, sigma={args.ssim_sigma:.4g}, "
-            f"range={args.ssim_data_range:.4g}, alpha={args.ssim_alpha:.4g}, "
-            f"min_valid_ratio={args.ssim_min_valid_ratio:.3g})"
-        )
+        if args.ssim_implementation == "custom":
+            print(
+                "Loss: SSIM-MSE "
+                f"(impl=custom, window={args.ssim_window_size}, sigma={args.ssim_sigma:.4g}, "
+                f"range={args.ssim_data_range:.4g}, alpha={args.ssim_alpha:.4g}, "
+                f"min_valid_ratio={args.ssim_min_valid_ratio:.3g})"
+            )
+            print(
+                "Loss formula: total=(1-alpha)*MSE + alpha*SSIM_component, "
+                "SSIM_component=0.5*(1-ssim_score)"
+            )
+        else:
+            print(
+                "Loss: SSIM-MSE "
+                f"(impl=monai, window={args.ssim_window_size}, k1=0.01, k2=0.03, "
+                f"range={args.ssim_data_range:.4g}, alpha={args.ssim_alpha:.4g}, "
+                f"min_valid_ratio={args.ssim_min_valid_ratio:.3g})"
+            )
+            print(
+                "Loss formula: total=(1-alpha)*MSE + alpha*SSIM_component, "
+                "SSIM_component=(1-ssim_score)"
+            )
     else:
         print(f"Loss: MSE")
+        print("Loss formula: total = MSE(pred, target) over supervised voxels")
     print(
         "Masking: "
         f"target_masked_fraction={args.target_masked_fraction:.4g}, "
         f"cluster_shape={args.cluster_shape}, "
         f"cluster_prob=0.8, "
-        f"center_selection_method={args.center_selection_method}"
+        f"center_selection_method={args.center_selection_method}, "
+        f"mask_fill_method={args.mask_fill_method}, "
+        f"mask_noise_std={args.mask_noise_std:.4g}"
     )
+    print(f"Model blocks: block_type={args.block_type}, use_mamba={args.use_mamba}, pre_head_mode={args.pre_head_mode}")
     print(f"Grad accumulation: {max(1, args.grad_accum_steps)} step(s)")
     if args.train_batches_per_epoch is not None:
         print(
@@ -1689,6 +2393,12 @@ def main():
                 print(f"  Val:   {[Path(p).parent.name for p in active_val]}")
             train_loader = None
             val_loaders = []
+            train_amp = {
+                "pred_mean": float("nan"),
+                "pred_std": float("nan"),
+                "target_mean": float("nan"),
+                "target_std": float("nan"),
+            }
 
             if args.train_batches_per_epoch is None:
                 train_loader, val_loaders = _build_loaders(
@@ -1702,8 +2412,8 @@ def main():
                     print("  WARNING: No usable training datasets this epoch; skipping.")
                     continue
 
-                train_loss = train_epoch(
-                    model, train_loader, optimizer, criterion, device,
+                train_details = train_epoch(
+                    model, train_loader, optimizer, criterion, mse_fn, huber_fn, ssim_fn, args.loss_type, device,
                     scaler=scaler, writer=writer, epoch=epoch, output_dir=output_dir,
                     train_paths=train_paths, val_paths=val_paths,
                     thermal_guard=thermal_guard,
@@ -1712,14 +2422,17 @@ def main():
                     ema=ema,
                     ema_update_every=args.ema_update_every,
                     return_details=True,
+                    fixed_amplitude_range=tensorboard_fixed_amplitude_range,
                 )
-                train_batches_processed = int(train_loss["batches_processed"])
-                train_loss = float(train_loss["loss"])
+                train_batches_processed = int(train_details["batches_processed"])
+                train_loss = float(train_details["loss"])
+                train_amp = train_details.get("amplitude_stats", train_amp)
             else:
                 target_batches = max(1, int(args.train_batches_per_epoch))
                 batches_done = 0
                 weighted_loss_sum = 0.0
                 pending_chunk_reload = False
+                train_amp_moments = _new_amplitude_stats()
 
                 while batches_done < target_batches:
                     _reload_t0 = time.monotonic()
@@ -1741,7 +2454,7 @@ def main():
                     remaining = target_batches - batches_done
 
                     details = train_epoch(
-                        model, train_loader, optimizer, criterion, device,
+                        model, train_loader, optimizer, criterion, mse_fn, huber_fn, ssim_fn, args.loss_type, device,
                         scaler=scaler, writer=writer, epoch=epoch, output_dir=output_dir,
                         train_paths=train_paths, val_paths=val_paths,
                         thermal_guard=thermal_guard,
@@ -1751,6 +2464,7 @@ def main():
                         ema_update_every=args.ema_update_every,
                         max_batches=remaining,
                         return_details=True,
+                        fixed_amplitude_range=tensorboard_fixed_amplitude_range,
                     )
                     chunk_batches = int(details["batches_processed"])
                     if chunk_batches <= 0:
@@ -1759,6 +2473,7 @@ def main():
 
                     weighted_loss_sum += float(details["loss"]) * chunk_batches
                     batches_done += chunk_batches
+                    _merge_amplitude_moments(train_amp_moments, details.get("amplitude_moments"))
 
                     if not bool(details["reload_requested"]):
                         break
@@ -1767,21 +2482,27 @@ def main():
 
                 train_loss = weighted_loss_sum / max(1, batches_done)
                 train_batches_processed = batches_done
+                train_amp = _finalize_amplitude_stats(train_amp_moments)
 
             if writer is not None and train_loader is not None:
                 _log_per_dataset_figures(
-                    model, train_loader, device, writer, epoch, train_loss
+                    model, train_loader, device, writer, epoch, train_loss,
+                    criterion=criterion, output_dir=output_dir,
+                    fixed_amplitude_range=tensorboard_fixed_amplitude_range,
                 )
 
             using_ema = ema is not None
             if using_ema:
                 ema.store(model)
                 ema.copy_to(model)
-            val_loss = validate(
-                model, val_loaders, criterion, device,
+            val_details = validate(
+                model, val_loaders, criterion, mse_fn, huber_fn, ssim_fn, args.loss_type, device,
                 writer=writer, epoch=epoch, thermal_guard=thermal_guard,
                 max_batches=args.val_batches_per_epoch,
+                fixed_amplitude_range=tensorboard_fixed_amplitude_range,
+                return_details=True,
             )
+            val_loss = float(val_details["loss"])
             if using_ema:
                 ema.restore(model)
 
@@ -1795,6 +2516,19 @@ def main():
                 print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
             else:
                 print(f"Train Loss: {train_loss:.4f}")
+            val_amp = val_details.get("amplitude_stats", {
+                "pred_mean": float("nan"),
+                "pred_std": float("nan"),
+                "target_mean": float("nan"),
+                "target_std": float("nan"),
+            })
+            print(
+                "Amplitude stats (supervised voxels):\n"
+                f"  train: pred_mean={train_amp['pred_mean']:.4f}, pred_std={train_amp['pred_std']:.4f}, "
+                f"target_mean={train_amp['target_mean']:.4f}, target_std={train_amp['target_std']:.4f}\n"
+                f"  val:   pred_mean={val_amp['pred_mean']:.4f}, pred_std={val_amp['pred_std']:.4f}, "
+                f"target_mean={val_amp['target_mean']:.4f}, target_std={val_amp['target_std']:.4f}"
+            )
 
             # End-of-epoch versioned checkpoint (never overwritten)
             epoch_ckpt = output_dir / f"checkpoint_epoch_{epoch + 1:04d}.pt"

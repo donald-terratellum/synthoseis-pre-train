@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from synthoseis_pre_train.masking import _select_cluster_centers, create_mask_3d
+from synthoseis_pre_train.masking import _select_cluster_centers, apply_mask_to_seismic, create_mask_3d
 
 
 @pytest.mark.parametrize(
@@ -211,3 +211,45 @@ def test_create_mask_3d_rejects_even_cluster_shape():
     seismic = np.zeros((2, 32, 32), dtype=np.float32)
     with pytest.raises(ValueError, match="cluster_shape"):
         create_mask_3d(seismic, cluster_shape=4)
+
+
+def test_apply_mask_to_seismic_zero_fill_preserves_unmasked_voxels():
+    seismic = np.arange(27, dtype=np.float32).reshape(3, 3, 3)
+    mask = np.ones_like(seismic, dtype=bool)
+    mask[:, 1, 1] = False
+
+    masked, original, out_mask = apply_mask_to_seismic(seismic, mask, fill_value=0.0)
+
+    np.testing.assert_array_equal(original, seismic)
+    np.testing.assert_array_equal(out_mask, mask)
+    np.testing.assert_array_equal(masked[mask], seismic[mask])
+    assert np.all(masked[~mask] == 0.0)
+
+
+def test_apply_mask_to_seismic_gaussian_fill_changes_only_masked_voxels():
+    seismic = np.zeros((4, 4, 4), dtype=np.float32)
+    mask = np.ones_like(seismic, dtype=bool)
+    mask[:, 2, 2] = False
+
+    masked, original, out_mask = apply_mask_to_seismic(
+        seismic,
+        mask,
+        fill_method="gaussian",
+        noise_std=0.05,
+    )
+
+    np.testing.assert_array_equal(original, seismic)
+    np.testing.assert_array_equal(out_mask, mask)
+    np.testing.assert_array_equal(masked[mask], seismic[mask])
+    assert np.any(np.abs(masked[~mask]) > 0.0)
+
+
+def test_apply_mask_to_seismic_rejects_invalid_fill_settings():
+    seismic = np.zeros((2, 2, 2), dtype=np.float32)
+    mask = np.ones_like(seismic, dtype=bool)
+
+    with pytest.raises(ValueError, match="fill_method"):
+        apply_mask_to_seismic(seismic, mask, fill_method="invalid")
+
+    with pytest.raises(ValueError, match="noise_std"):
+        apply_mask_to_seismic(seismic, mask, fill_method="gaussian", noise_std=-1.0)

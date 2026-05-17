@@ -3,7 +3,45 @@
 # Multi-dataset seismic training script
 # Trains on all synthetic seismic datasets in a folder
 
-set -euo pipefail
+set -Eeuo pipefail
+
+# Emit explicit failure diagnostics to stdout/stderr logs, including the
+# failing command and exit code, even when output is redirected/appended.
+__last_failed_cmd=""
+__last_failed_code=0
+__err_reported=0
+__last_cmd=""
+__this_cmd=""
+
+__on_debug() {
+  __last_cmd=${__this_cmd}
+  __this_cmd=${BASH_COMMAND}
+}
+
+__on_err() {
+  local exit_code=$?
+  local failed_cmd="${__this_cmd:-${__last_cmd:-${BASH_COMMAND:-unknown}}}"
+  __last_failed_code=$exit_code
+  __last_failed_cmd=${failed_cmd}
+  __err_reported=1
+  echo "ERROR: command failed with exit code ${exit_code}: ${__last_failed_cmd}" >&2
+}
+
+__on_exit() {
+  local exit_code=$?
+  if [[ ${exit_code} -ne 0 ]]; then
+    if [[ ${__err_reported} -eq 1 ]]; then
+      echo "FATAL: train_multi_datasets.sh exiting with code ${exit_code} (last failed command: ${__last_failed_cmd})" >&2
+    else
+      local fallback_cmd="${__this_cmd:-${__last_cmd:-unknown}}"
+      echo "FATAL: train_multi_datasets.sh exiting with code ${exit_code} (last command: ${fallback_cmd})" >&2
+    fi
+  fi
+}
+
+trap '__on_debug' DEBUG
+trap '__on_err' ERR
+trap '__on_exit' EXIT
 
 # Suppress noisy macOS allocator warnings inherited by Python subprocesses.
 # Setting to "0" (not unset) is an explicit disable signal to libmalloc.
@@ -70,6 +108,16 @@ OUTPUT_DIR=${OUTPUT_DIR:-"checkpoints"}
 TARGET_MASKED_FRACTION=${TARGET_MASKED_FRACTION:-0.15}
 CLUSTER_SHAPE=${CLUSTER_SHAPE:-3}
 CENTER_SELECTION_METHOD=${CENTER_SELECTION_METHOD:-random_mixture}
+MASK_FILL_METHOD=${MASK_FILL_METHOD:-zero}
+MASK_NOISE_STD=${MASK_NOISE_STD:-1e-2}
+AMPLITUDE_TRANSFORM=${AMPLITUDE_TRANSFORM:-example_stdev_scaling}
+QUANTILE_SYMMETRY_MODE=${QUANTILE_SYMMETRY_MODE:-strict_odd}
+QUANTILE_EPSILON=${QUANTILE_EPSILON:-1e-6}
+TRANSFORMS_GROUP=${TRANSFORMS_GROUP:-transforms}
+BLOCK_TYPE=${BLOCK_TYPE:-resblock}
+PRE_HEAD_MODE=${PRE_HEAD_MODE:-norm_gelu}
+MODEL_ARCH=${MODEL_ARCH:-unet}
+ARCH_PRESET=${ARCH_PRESET:-""}
 LOSS_TYPE=${LOSS_TYPE:-huber}
 HUBER_DELTA=${HUBER_DELTA:-0.1}
 SSIM_WINDOW_SIZE=${SSIM_WINDOW_SIZE:-16}
@@ -77,6 +125,7 @@ SSIM_SIGMA=${SSIM_SIGMA:-2.6666667}
 SSIM_DATA_RANGE=${SSIM_DATA_RANGE:-30.0}
 SSIM_ALPHA=${SSIM_ALPHA:-0.1666667}
 SSIM_MIN_VALID_RATIO=${SSIM_MIN_VALID_RATIO:-0.5}
+SSIM_IMPLEMENTATION=${SSIM_IMPLEMENTATION:-custom}
 ENABLE_CLUSTER_LOSS=${ENABLE_CLUSTER_LOSS:-false}
 CLUSTER_KERNEL_SIZE=${CLUSTER_KERNEL_SIZE:-5}
 CLUSTER_EPS=${CLUSTER_EPS:-1e-6}
@@ -86,6 +135,10 @@ RESUME=${RESUME:-""}
 MONITOR_DISABLED=${MONITOR_DISABLED:-false}
 MONITOR_INTERVAL_SEC=${MONITOR_INTERVAL_SEC:-300}
 MONITOR_CSV_PATH=${MONITOR_CSV_PATH:-""}
+
+# Track explicit CLI overrides so they can take precedence over presets.
+MODEL_ARCH_SET=false
+BLOCK_TYPE_SET=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -199,6 +252,48 @@ while [[ $# -gt 0 ]]; do
       CENTER_SELECTION_METHOD="$2"
       shift 2
       ;;
+    --mask-fill-method)
+      MASK_FILL_METHOD="$2"
+      shift 2
+      ;;
+    --mask-noise-std)
+      MASK_NOISE_STD="$2"
+      shift 2
+      ;;
+    --amplitude-transform)
+      AMPLITUDE_TRANSFORM="$2"
+      shift 2
+      ;;
+    --quantile-symmetry-mode)
+      QUANTILE_SYMMETRY_MODE="$2"
+      shift 2
+      ;;
+    --quantile-epsilon)
+      QUANTILE_EPSILON="$2"
+      shift 2
+      ;;
+    --transforms-group)
+      TRANSFORMS_GROUP="$2"
+      shift 2
+      ;;
+    --block-type)
+      BLOCK_TYPE="$2"
+      BLOCK_TYPE_SET=true
+      shift 2
+      ;;
+    --pre-head-mode)
+      PRE_HEAD_MODE="$2"
+      shift 2
+      ;;
+    --model-arch)
+      MODEL_ARCH="$2"
+      MODEL_ARCH_SET=true
+      shift 2
+      ;;
+    --arch-preset)
+      ARCH_PRESET="$2"
+      shift 2
+      ;;
     --loss-type)
       LOSS_TYPE="$2"
       shift 2
@@ -225,6 +320,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ssim-min-valid-ratio)
       SSIM_MIN_VALID_RATIO="$2"
+      shift 2
+      ;;
+    --ssim-implementation)
+      SSIM_IMPLEMENTATION="$2"
       shift 2
       ;;
     --enable-cluster-loss)
@@ -314,6 +413,29 @@ while [[ $# -gt 0 ]]; do
       echo "  --center-selection-method METHOD"
       echo "                       random_mixture|mitchell_best_candidate|poisson_disc|uniform_random"
       echo "                       (default: random_mixture)"
+      echo "  --mask-fill-method METHOD"
+      echo "                       zero|gaussian (default: zero)"
+      echo "  --mask-noise-std NUM"
+      echo "                       Std-dev for gaussian mask infill (default: 1e-2)"
+      echo "  --amplitude-transform MODE"
+      echo "                       example_stdev_scaling|dataset_quantile_scaling|histogram_equalization"
+      echo "                       (renamed from: standardize|quantile_normal)"
+      echo "  --quantile-symmetry-mode MODE"
+      echo "                       strict_odd|independent (default: strict_odd)"
+      echo "  --quantile-epsilon NUM"
+      echo "                       Epsilon for quantile->normal mapping in (0,0.5)"
+      echo "                       (default: 1e-6)"
+      echo "  --transforms-group SUBGROUP"
+      echo "                       Zarr subgroup for persisted transforms (default: transforms)"
+      echo "  --block-type TYPE   Residual block family: resblock|anisotropic (default: resblock)"
+      echo "  --pre-head-mode TYPE"
+      echo "                       Pre-head projection mode: identity|norm|norm_gelu"
+      echo "                       (default: norm_gelu)"
+      echo "  --model-arch TYPE   Backbone architecture: unet|dynunet (default: unet)"
+      echo "  --arch-preset TYPE  Convenience preset mapping to model-arch/block-type:"
+      echo "                       unet|unet_anisotropic|dyn_unet"
+      echo "                       (explicit --model-arch/--block-type flags override preset)"
+      echo "                       example: --arch-preset dyn_unet --block-type anisotropic"
       echo "  --loss-type TYPE     Loss function: mse|huber|ssim_mse (default: huber)"
       echo "  --huber-delta NUM    Delta parameter for Huber loss (default: 0.1)"
       echo "  --ssim-window-size N 3D SSIM Gaussian window size (default: 16)"
@@ -324,6 +446,8 @@ while [[ $# -gt 0 ]]; do
       echo "                       (default: 0.1666667, matching prior 0.2 weight ratio)"
       echo "  --ssim-min-valid-ratio NUM"
       echo "                       Minimum local valid support ratio in [0,1] (default: 0.5)"
+      echo "  --ssim-implementation TYPE"
+      echo "                       SSIM backend for ssim_mse: custom|monai (default: custom)"
       echo "  --enable-cluster-loss  Enable composite cluster-aware loss that upweights traces near masked clusters"
       echo "  --cluster-kernel-size N" \
       echo "                       Kernel size for 2D uniform filter applied to trace mask (odd int, default: 5)"
@@ -347,9 +471,34 @@ while [[ $# -gt 0 ]]; do
     *)
       echo "Unknown option: $1"
       echo "Use --help for usage information"
+      __last_failed_cmd="argument parsing: unknown option '$1'"
+      __last_failed_code=1
+      __err_reported=1
       exit 1
       ;;
   esac
+
+# Optional convenience preset; explicit --model-arch/--block-type flags win.
+if [[ -n "${ARCH_PRESET}" ]]; then
+  case "${ARCH_PRESET}" in
+    unet)
+      [[ "${MODEL_ARCH_SET}" == "false" ]] && MODEL_ARCH="unet"
+      [[ "${BLOCK_TYPE_SET}" == "false" ]] && BLOCK_TYPE="resblock"
+      ;;
+    unet_anisotropic)
+      [[ "${MODEL_ARCH_SET}" == "false" ]] && MODEL_ARCH="unet"
+      [[ "${BLOCK_TYPE_SET}" == "false" ]] && BLOCK_TYPE="anisotropic"
+      ;;
+    dyn_unet)
+      [[ "${MODEL_ARCH_SET}" == "false" ]] && MODEL_ARCH="dynunet"
+      [[ "${BLOCK_TYPE_SET}" == "false" ]] && BLOCK_TYPE="resblock"
+      ;;
+    *)
+      echo "ERROR: --arch-preset must be one of unet|unet_anisotropic|dyn_unet (got: ${ARCH_PRESET})"
+      exit 1
+      ;;
+  esac
+fi
 done
 
 case "${LOSS_TYPE}" in
@@ -391,6 +540,15 @@ if ! awk "BEGIN { exit !(${SSIM_MIN_VALID_RATIO} >= 0 && ${SSIM_MIN_VALID_RATIO}
   exit 1
 fi
 
+case "${SSIM_IMPLEMENTATION}" in
+  custom|monai)
+    ;;
+  *)
+    echo "ERROR: --ssim-implementation must be one of custom|monai (got: ${SSIM_IMPLEMENTATION})"
+    exit 1
+    ;;
+esac
+
 
 
 if ! awk "BEGIN { exit !(${TARGET_MASKED_FRACTION} >= 0 && ${TARGET_MASKED_FRACTION} <= 1) }"; then
@@ -408,6 +566,78 @@ case "${CENTER_SELECTION_METHOD}" in
     ;;
   *)
     echo "ERROR: --center-selection-method must be one of random_mixture|mitchell_best_candidate|poisson_disc|uniform_random (got: ${CENTER_SELECTION_METHOD})"
+    exit 1
+    ;;
+esac
+
+case "${MASK_FILL_METHOD}" in
+  zero|gaussian)
+    ;;
+  *)
+    echo "ERROR: --mask-fill-method must be one of zero|gaussian (got: ${MASK_FILL_METHOD})"
+    exit 1
+    ;;
+esac
+
+if ! awk "BEGIN { exit !(${MASK_NOISE_STD} >= 0) }"; then
+  echo "ERROR: --mask-noise-std must be >= 0 (got: ${MASK_NOISE_STD})"
+  exit 1
+fi
+
+case "${AMPLITUDE_TRANSFORM}" in
+  example_stdev_scaling|dataset_quantile_scaling|histogram_equalization)
+    ;;
+  standardize)
+    echo "ERROR: --amplitude-transform standardize was renamed to example_stdev_scaling"
+    exit 1
+    ;;
+  quantile_normal)
+    echo "ERROR: --amplitude-transform quantile_normal was renamed to dataset_quantile_scaling"
+    exit 1
+    ;;
+  *)
+    echo "ERROR: --amplitude-transform must be one of example_stdev_scaling|dataset_quantile_scaling|histogram_equalization (got: ${AMPLITUDE_TRANSFORM})"
+    exit 1
+    ;;
+esac
+
+case "${QUANTILE_SYMMETRY_MODE}" in
+  strict_odd|independent)
+    ;;
+  *)
+    echo "ERROR: --quantile-symmetry-mode must be one of strict_odd|independent (got: ${QUANTILE_SYMMETRY_MODE})"
+    exit 1
+    ;;
+esac
+
+if ! awk "BEGIN { exit !(${QUANTILE_EPSILON} > 0 && ${QUANTILE_EPSILON} < 0.5) }"; then
+  echo "ERROR: --quantile-epsilon must be in (0, 0.5) (got: ${QUANTILE_EPSILON})"
+  exit 1
+fi
+
+case "${BLOCK_TYPE}" in
+  resblock|anisotropic)
+    ;;
+  *)
+    echo "ERROR: --block-type must be one of resblock|anisotropic (got: ${BLOCK_TYPE})"
+    exit 1
+    ;;
+esac
+
+case "${PRE_HEAD_MODE}" in
+  identity|norm|norm_gelu)
+    ;;
+  *)
+    echo "ERROR: --pre-head-mode must be one of identity|norm|norm_gelu (got: ${PRE_HEAD_MODE})"
+    exit 1
+    ;;
+esac
+
+case "${MODEL_ARCH}" in
+  unet|dynunet)
+    ;;
+  *)
+    echo "ERROR: --model-arch must be one of unet|dynunet (got: ${MODEL_ARCH})"
     exit 1
     ;;
 esac
@@ -436,6 +666,17 @@ echo "Grad accumulation:  ${GRAD_ACCUM_STEPS}"
 echo "Grad clip norm:     ${GRAD_CLIP_NORM}"
 echo "EMA decay:          ${EMA_DECAY}"
 echo "EMA update every:   ${EMA_UPDATE_EVERY} step(s)"
+echo "Mask fill method:   ${MASK_FILL_METHOD}"
+echo "Mask noise std:     ${MASK_NOISE_STD}"
+echo "Amplitude xform:    ${AMPLITUDE_TRANSFORM}"
+echo "Quantile symmetry:  ${QUANTILE_SYMMETRY_MODE}"
+echo "Quantile epsilon:   ${QUANTILE_EPSILON}"
+echo "Transforms group:   ${TRANSFORMS_GROUP}"
+echo "Block type:         ${BLOCK_TYPE}"
+echo "Pre-head mode:      ${PRE_HEAD_MODE}"
+echo "Model arch:         ${MODEL_ARCH}"
+echo "SSIM impl:          ${SSIM_IMPLEMENTATION}"
+[[ -n "${ARCH_PRESET}" ]] && echo "Arch preset:        ${ARCH_PRESET}"
 [[ -n "${RESUME}" ]] && echo "Resume from: ${RESUME}"
 echo ""
 
@@ -484,6 +725,11 @@ else
   exit 1
 fi
 
+ENABLE_CLUSTER_LOSS_FLAG=""
+if [[ "${ENABLE_CLUSTER_LOSS}" == "true" ]]; then
+  ENABLE_CLUSTER_LOSS_FLAG="--enable_cluster_loss"
+fi
+
 $PYRUN ./train.py \
   --data_folder "${DATA_FOLDER}" \
   --batch_size "${BATCH_SIZE}" \
@@ -494,6 +740,15 @@ $PYRUN ./train.py \
   --target_masked_fraction "${TARGET_MASKED_FRACTION}" \
   --cluster_shape "${CLUSTER_SHAPE}" \
   --center_selection_method "${CENTER_SELECTION_METHOD}" \
+  --mask_fill_method "${MASK_FILL_METHOD}" \
+  --mask_noise_std "${MASK_NOISE_STD}" \
+  --amplitude_transform "${AMPLITUDE_TRANSFORM}" \
+  --quantile_symmetry_mode "${QUANTILE_SYMMETRY_MODE}" \
+  --quantile_epsilon "${QUANTILE_EPSILON}" \
+  --transforms_group "${TRANSFORMS_GROUP}" \
+  --block_type "${BLOCK_TYPE}" \
+  --pre_head_mode "${PRE_HEAD_MODE}" \
+  --model-arch "${MODEL_ARCH}" \
   --train_batches_per_epoch "${TRAIN_BATCHES_PER_EPOCH}" \
   --val_batches_per_epoch "${VAL_BATCHES_PER_EPOCH}" \
   --refresh_every_batches "${REFRESH_EVERY_BATCHES}" \
@@ -518,7 +773,8 @@ $PYRUN ./train.py \
   --ssim_data_range "${SSIM_DATA_RANGE}" \
   --ssim_alpha "${SSIM_ALPHA}" \
   --ssim_min_valid_ratio "${SSIM_MIN_VALID_RATIO}" \
-  ${ENABLE_CLUSTER_LOSS:+--enable_cluster_loss} \
+  --ssim_implementation "${SSIM_IMPLEMENTATION}" \
+  ${ENABLE_CLUSTER_LOSS_FLAG} \
   --cluster_kernel_size "${CLUSTER_KERNEL_SIZE}" \
   --cluster_eps "${CLUSTER_EPS}" \
   --cluster_base_weight "${CLUSTER_BASE_WEIGHT}" \
@@ -526,274 +782,3 @@ $PYRUN ./train.py \
   ${RESUME:+--resume "${RESUME}"}
 
 echo "=== Multi-dataset training complete ==="
-#!/usr/bin/env bash
-
-# Multi-dataset seismic training script
-# Trains on all synthetic seismic datasets in a folder
-
-set -euo pipefail
-
-# Suppress noisy macOS allocator warnings inherited by Python subprocesses.
-# Setting to "0" (not unset) is an explicit disable signal to libmalloc.
-if [[ "${OSTYPE:-}" == darwin* ]]; then
-  export MallocStackLogging=0
-  export MallocStackLoggingNoCompact=0
-fi
-
-# ---------------------------------------------------------------------------
-# Overnight mode: pre-set safer defaults BEFORE the normal defaults block so
-# explicit CLI flags can still override any individual value afterwards.
-# Activated by passing --overnight anywhere in the argument list.
-# ---------------------------------------------------------------------------
-OVERNIGHT=false
-for _arg in "$@"; do
-  if [[ "${_arg}" == "--overnight" ]]; then
-    OVERNIGHT=true
-    THERMAL_MAX_C=${THERMAL_MAX_C:-80}
-    THERMAL_COOLDOWN_SEC=${THERMAL_COOLDOWN_SEC:-420}
-    THERMAL_CHECK_EVERY_BATCHES=${THERMAL_CHECK_EVERY_BATCHES:-5}
-    THERMAL_PRESSURE_TRIP_LEVEL=${THERMAL_PRESSURE_TRIP_LEVEL:-fair}
-    GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-6}
-    GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-0.7}
-    LR_WARMUP_EPOCHS=${LR_WARMUP_EPOCHS:-8}
-    LR_WARMUP_START_FACTOR=${LR_WARMUP_START_FACTOR:-0.05}
-    EMA_DECAY=${EMA_DECAY:-0.9995}
-    break
-  fi
-done
-
-# Default parameters
-MAX_EPOCHS=${MAX_EPOCHS:-25}
-DATA_FOLDER=${DATA_FOLDER:-"/Users/donaldpg/synthoseis/fake_data"}
-BATCH_SIZE=${BATCH_SIZE:-auto}
-SAMPLE_SHAPE=${SAMPLE_SHAPE:-"128 128 128"}
-DEVICE=${DEVICE:-"auto"}
-VAL_SPLIT_RATIO=${VAL_SPLIT_RATIO:-0.2}
-TRAIN_BATCHES_PER_EPOCH=${TRAIN_BATCHES_PER_EPOCH:-120}
-VAL_BATCHES_PER_EPOCH=${VAL_BATCHES_PER_EPOCH:-30}
-REFRESH_EVERY_BATCHES=${REFRESH_EVERY_BATCHES:-10}
-THERMAL_MAX_C=${THERMAL_MAX_C:-85}
-THERMAL_COOLDOWN_SEC=${THERMAL_COOLDOWN_SEC:-300}
-THERMAL_CHECK_EVERY_BATCHES=${THERMAL_CHECK_EVERY_BATCHES:-10}
-THERMAL_PRESSURE_TRIP_LEVEL=${THERMAL_PRESSURE_TRIP_LEVEL:-serious}
-LR_SCHEDULE=${LR_SCHEDULE:-poly}
-LR_POLY_POWER=${LR_POLY_POWER:-0.9}
-LR_MIN=${LR_MIN:-1e-6}
-LR_WARMUP_EPOCHS=${LR_WARMUP_EPOCHS:-5}
-LR_WARMUP_START_FACTOR=${LR_WARMUP_START_FACTOR:-0.1}
-GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
-GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-1.0}
-EMA_DECAY=${EMA_DECAY:-0.999}
-EMA_UPDATE_EVERY=${EMA_UPDATE_EVERY:-1}
-RESUME=${RESUME:-""}
-
-# Parse command line arguments
-while [[ $# -gt 0 ]]; do
-  case $1 in
-    --max-epochs)
-      MAX_EPOCHS="$2"
-      shift 2
-      ;;
-    --data-folder)
-      DATA_FOLDER="$2"
-      shift 2
-      ;;
-    --batch-size)
-      BATCH_SIZE="$2"
-      shift 2
-      ;;
-    --sample-shape)
-      SAMPLE_SHAPE="$2"
-      shift 2
-      ;;
-    --device)
-      DEVICE="$2"
-      shift 2
-      ;;
-    --val-split-ratio)
-      VAL_SPLIT_RATIO="$2"
-      shift 2
-      ;;
-    --train-batches-per-epoch)
-      TRAIN_BATCHES_PER_EPOCH="$2"
-      shift 2
-      ;;
-    --val-batches-per-epoch)
-      VAL_BATCHES_PER_EPOCH="$2"
-      shift 2
-      ;;
-    --refresh-every-batches)
-      REFRESH_EVERY_BATCHES="$2"
-      shift 2
-      ;;
-    --thermal-max-c)
-      THERMAL_MAX_C="$2"
-      shift 2
-      ;;
-    --thermal-cooldown-sec)
-      THERMAL_COOLDOWN_SEC="$2"
-      shift 2
-      ;;
-    --thermal-check-every-batches)
-      THERMAL_CHECK_EVERY_BATCHES="$2"
-      shift 2
-      ;;
-    --thermal-pressure-trip-level)
-      THERMAL_PRESSURE_TRIP_LEVEL="$2"
-      shift 2
-      ;;
-    --lr-schedule)
-      LR_SCHEDULE="$2"
-      shift 2
-      ;;
-    --lr-poly-power)
-      LR_POLY_POWER="$2"
-      shift 2
-      ;;
-    --lr-min)
-      LR_MIN="$2"
-      shift 2
-      ;;
-    --lr-warmup-epochs)
-      LR_WARMUP_EPOCHS="$2"
-      shift 2
-      ;;
-    --lr-warmup-start-factor)
-      LR_WARMUP_START_FACTOR="$2"
-      shift 2
-      ;;
-    --grad-accum-steps)
-      GRAD_ACCUM_STEPS="$2"
-      shift 2
-      ;;
-    --grad-clip-norm)
-      GRAD_CLIP_NORM="$2"
-      shift 2
-      ;;
-    --ema-decay)
-      EMA_DECAY="$2"
-      shift 2
-      ;;
-    --ema-update-every)
-      EMA_UPDATE_EVERY="$2"
-      shift 2
-      ;;
-    --overnight)
-      # Already handled above; consume the flag so it isn't treated as unknown.
-      shift
-      ;;
-    --resume)
-      RESUME="$2"
-      shift 2
-      ;;
-    --help)
-      echo "Usage: $0 [OPTIONS]"
-      echo ""
-      echo "Train on multiple synthetic seismic datasets"
-      echo ""
-      echo "Options:"
-      echo "  --max-epochs NUM      Maximum epochs for training (default: 25)"
-      echo "  --data-folder PATH    Top-level folder containing datasets (default: /Users/donaldpg/synthoseis/fake_data)"
-      echo "  --batch-size NUM|auto Batch size or 'auto' for automatic calculation (default: auto)"
-      echo "  --sample-shape 'X Y Z' Sample shape (default: '128 128 128')"
-      echo "  --device DEV          Device (auto/cuda/mps/cpu) (default: auto)"
-      echo "  --val-split-ratio R   Validation split ratio over discovered datasets"
-      echo "                       (default: 0.2)"
-      echo "  --train-batches-per-epoch N"
-      echo "                       Fixed number of train batches per epoch (default: 120)"
-      echo "  --val-batches-per-epoch N"
-      echo "                       Fixed number of val batches per epoch (default: 30)"
-      echo "  --refresh-every-batches N"
-      echo "                       Deprecated compatibility flag; dataset discovery/pruning"
-      echo "                       now runs at epoch boundaries (default: 10)"
-      echo "  --thermal-max-c NUM   Pause when CPU temperature reaches this Celsius value (default: 85)"
-      echo "  --thermal-cooldown-sec NUM"
-      echo "                       Cooldown pause in seconds after a thermal trip (default: 300)"
-      echo "  --thermal-check-every-batches NUM"
-      echo "                       Check CPU temperature every N training batches (default: 10)"
-      echo "  --thermal-pressure-trip-level LVL"
-      echo "                       Pause for thermal pressure at/above this level:"
-      echo "                       off|nominal|fair|serious|critical (default: serious)"
-      echo "  --lr-schedule MODE   LR schedule: poly|cosine|constant (default: poly)"
-      echo "  --lr-poly-power NUM  Polynomial power for poly LR schedule (default: 0.9)"
-      echo "  --lr-min NUM         Minimum LR floor for poly/cosine (default: 1e-6)"
-      echo "  --lr-warmup-epochs N Warmup epochs before LR decay (default: 5)"
-      echo "  --lr-warmup-start-factor NUM"
-      echo "                       Warmup start as fraction of base LR (default: 0.1)"
-      echo "  --grad-accum-steps N Gradient accumulation steps (default: 1)"
-      echo "  --grad-clip-norm NUM Global gradient clipping max-norm (default: 1.0; <=0 disables)"
-      echo "  --ema-decay NUM      EMA decay (default: 0.999; <=0 disables)"
-      echo "  --ema-update-every N EMA update cadence in optimizer steps (default: 1)"
-      echo "  --overnight           Enable overnight/unattended mode: applies safer thermal defaults"
-      echo "                       (max-c 80, cooldown 420s, check every 5 batches, pressure=fair)"
-      echo "                       and stability-first optimizer settings. Individual flags override."
-      echo "  --resume PATH         Resume from checkpoint file (e.g. checkpoints/partial_latest.pt)"
-      echo "  --help                Show this help message"
-      exit 0
-      ;;
-    *)
-      echo "Unknown option: $1"
-      echo "Use --help for usage information"
-      exit 1
-      ;;
-  esac
-done
-
-[[ "${OVERNIGHT}" == "true" ]] && echo "*** Overnight mode active — safer thermal and stability defaults applied ***"
-echo "=== Multi-dataset Seismic Training ==="
-echo "Data folder: ${DATA_FOLDER}"
-echo "Max epochs: ${MAX_EPOCHS}"
-echo "Batch size: ${BATCH_SIZE}"
-echo "Sample shape: ${SAMPLE_SHAPE}"
-echo "Device: ${DEVICE}"
-echo "Val split ratio:    ${VAL_SPLIT_RATIO}"
-echo "Train/val counts:   auto-resolved from discovered dataset count"
-echo "Train batches/epoch: ${TRAIN_BATCHES_PER_EPOCH}"
-echo "Val batches/epoch:   ${VAL_BATCHES_PER_EPOCH}"
-echo "Refresh every:      ${REFRESH_EVERY_BATCHES} train batches (deprecated; epoch-boundary refresh is used)"
-echo "Thermal max C:      ${THERMAL_MAX_C}"
-echo "Thermal cooldown:   ${THERMAL_COOLDOWN_SEC}s"
-echo "Thermal check rate: every ${THERMAL_CHECK_EVERY_BATCHES} batches"
-echo "Thermal pressure trip level: ${THERMAL_PRESSURE_TRIP_LEVEL}"
-echo "LR schedule:        ${LR_SCHEDULE}"
-echo "LR poly power:      ${LR_POLY_POWER}"
-echo "LR min:             ${LR_MIN}"
-echo "LR warmup:          ${LR_WARMUP_EPOCHS} epoch(s), start factor ${LR_WARMUP_START_FACTOR}"
-echo "Grad accumulation:  ${GRAD_ACCUM_STEPS}"
-echo "Grad clip norm:     ${GRAD_CLIP_NORM}"
-echo "EMA decay:          ${EMA_DECAY}"
-echo "EMA update every:   ${EMA_UPDATE_EVERY} step(s)"
-[[ -n "${RESUME}" ]] && echo "Resume from: ${RESUME}"
-echo ""
-
-# Calculate batch size if set to auto
-if [[ "${BATCH_SIZE}" == "auto" ]]; then
-    echo "Calculating optimal batch size..."
-  if CALCULATED_BATCH_SIZE=$(uv run python calculate_batch_size.py \
-    --sample-shape ${SAMPLE_SHAPE} \
-    --device "${DEVICE}" \
-    --quiet); then
-        BATCH_SIZE="${CALCULATED_BATCH_SIZE}"
-        echo "Using calculated batch size: ${BATCH_SIZE}"
-    else
-    echo "WARNING: Failed to calculate batch size automatically; using fallback batch size of 1"
-        BATCH_SIZE=1
-    fi
-    echo ""
-fi
-
-# Verify data folder contains at least one seismic dataset folder
-INITIAL_COUNT=$(find "${DATA_FOLDER}" -maxdepth 1 -type d -name "seismic__*" | wc -l | tr -d ' ')
-if [[ "${INITIAL_COUNT}" -eq 0 ]]; then
-    echo "ERROR: No seismic datasets found in ${DATA_FOLDER}"
-    echo "Expected folders matching 'seismic__*'"
-    exit 1
-fi
-
-echo "Found ${INITIAL_COUNT} dataset folder(s) in ${DATA_FOLDER} at startup"
-echo ""
-
-# Training is invoked earlier via the $PYRUN block above which forwards
-# all relevant loss/SSIM/cluster flags to the local ./train.py.  The older
-# direct invocation using `uv run python -u train.py` was removed to avoid
-# accidentally running a different `train.py` from PATH.

@@ -149,6 +149,29 @@ read_total_datasets_from_log() {
     echo $(( n_train + n_val ))
 }
 
+# Count seismic dataset directories in ZARR_FOLDER.
+count_seismic_datasets() {
+    find "$ZARR_FOLDER" -maxdepth 1 -mindepth 1 -type d -name 'seismic__*' 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Pause dataset generation while the folder is at or above capacity.
+# Re-check every 30 minutes until the count drops below 14.
+wait_for_dataset_capacity() {
+    local max_datasets=14
+    local sleep_secs=1800
+    local current_count
+
+    current_count=$(count_seismic_datasets)
+    while (( current_count >= max_datasets )); do
+        echo "Dataset cap guard: found ${current_count} seismic datasets (limit: < ${max_datasets})."
+        echo "  Sleeping 30m before re-checking dataset count..."
+        sleep "$sleep_secs"
+        current_count=$(count_seismic_datasets)
+    done
+
+    echo "Dataset cap guard: ${current_count} seismic datasets; continuing generation."
+}
+
 # ── sanity checks ─────────────────────────────────────────────────────────────
 if [[ ! -d "$ZARR_FOLDER" ]]; then
     echo "ERROR: ZARR_FOLDER '$ZARR_FOLDER' does not exist." >&2
@@ -201,6 +224,9 @@ for (( i=0; i<NUM_RUNS; i++ )); do
     echo "──────────────────────────────────────────"
     echo "Run $((i+1))/$NUM_RUNS  →  tag: $run_tag"
     echo "──────────────────────────────────────────"
+
+    # ── Capacity guard: avoid generating when too many seismic datasets exist ──
+    wait_for_dataset_capacity
 
     # ── 0. Throttle: ≤ ⌊total_datasets/3⌋ replacements per training epoch ──
     if [[ -n "$CHECK_LOG" ]]; then

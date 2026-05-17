@@ -4,11 +4,43 @@ Seismic 3D Masking Strategies
 Implements masking for seismic pre-training:
 - Peak/trough preservation along vertical axis
 - Random trace masking with 3x3 cluster patterns
-- Zero-masking for masked voxels
+- Mask-value infill with zero or Gaussian noise
 """
 
 import numpy as np
 from typing import Tuple, Optional
+
+
+def _generate_triangular_kernel(length: int, power: float) -> np.ndarray:
+    """Generate normalized triangular kernel [1,3,5,...,peak,...,5,3,1]**power."""
+    if length < 1 or length % 2 == 0:
+        raise ValueError("kernel length must be a positive odd integer")
+    if power <= 0:
+        raise ValueError("kernel power must be > 0")
+
+    mid = (length + 1) // 2
+    kernel = np.concatenate([
+        np.arange(1, 2 * mid, 2, dtype=np.float64),
+        np.arange(2 * mid - 3, 0, -2, dtype=np.float64),
+    ])
+    kernel = np.power(kernel, float(power))
+    kernel /= kernel.sum()
+    return kernel
+
+
+def _prefilter_along_z(
+    seismic_data: np.ndarray,
+    kernel_length: int = 19,
+    kernel_power: float = 1.6,
+) -> np.ndarray:
+    """Prefilter seismic along z only, for extrema index detection."""
+    kernel = _generate_triangular_kernel(kernel_length, kernel_power)
+    # Keep this temporary array float64 to match strict-neighbor comparisons.
+    return np.apply_along_axis(
+        lambda trace: np.convolve(trace.astype(np.float64, copy=False), kernel, mode="same"),
+        axis=0,
+        arr=seismic_data,
+    )
 
 
 def _expected_cluster_footprint(cluster_shape: int) -> float:
@@ -48,6 +80,8 @@ def create_mask_3d(
     cluster_shape: int = 3,
     center_selection_method: str = "random_mixture",
     random_seed: Optional[int] = None,
+    extrema_prefilter_kernel_length: int = 19,
+    extrema_prefilter_power: float = 1.6,
 ) -> np.ndarray:
     """
     Create a 3D mask for seismic data with clustered trace masking.
@@ -65,6 +99,10 @@ def create_mask_3d(
         cluster_shape: side length of square cluster (odd integer, e.g. 3)
         center_selection_method: sampling method for cluster centers
         random_seed: Optional RNG seed
+        extrema_prefilter_kernel_length: odd kernel length for temporary
+            peak/trough index prefilter along z
+        extrema_prefilter_power: kernel exponent for temporary peak/trough
+            index prefilter along z
 
     Returns:
         mask: Boolean array where True = preserve, False = masked
@@ -91,6 +129,13 @@ def create_mask_3d(
 
     # Preserve local peaks/troughs along depth axis (z) when possible
     if z > 2:
+        # Filter only for index detection; raw seismic values remain untouched.
+        prefiltered = _prefilter_along_z(
+            seismic_data,
+            kernel_length=int(extrema_prefilter_kernel_length),
+            kernel_power=float(extrema_prefilter_power),
+        )
+
         nonzero_z = np.where(seismic_data.any(axis=(1, 2)))[0]
         boundary_lo = None
         boundary_hi = None
@@ -98,7 +143,7 @@ def create_mask_3d(
             z_lo = int(nonzero_z[0])
             z_hi = int(nonzero_z[-1])
             if z_lo > 0 or z_hi < z - 1:
-                work = seismic_data.copy()
+                work = prefiltered.copy()
                 if z_lo > 0:
                     work[z_lo - 1] = work[z_lo]
                     boundary_lo = z_lo - 1
@@ -106,9 +151,9 @@ def create_mask_3d(
                     work[z_hi + 1] = work[z_hi]
                     boundary_hi = z_hi + 1
             else:
-                work = seismic_data
+                work = prefiltered
         else:
-            work = seismic_data
+            work = prefiltered
 
         is_peak = (work[1:-1, :, :] > work[:-2, :, :]) & (work[1:-1, :, :] > work[2:, :, :])
         is_trough = (work[1:-1, :, :] < work[:-2, :, :]) & (work[1:-1, :, :] < work[2:, :, :])
@@ -121,10 +166,16 @@ def create_mask_3d(
         if boundary_hi is not None:
             mask[boundary_hi, :, :] = False
 
+        # Explicitly release temporary prefiltered volumes.
+        del prefiltered
+        if work is not seismic_data:
+            del work
+
     # Clustered trace masking
     total_traces = x * y
     n_centers = _estimate_center_count_for_target_mask_ratio(
-        width=x, height=y, target_mask_fraction=target_masked_fraction, cluster_shape=cluster_shape, cluster_prob=cluster_prob
+        width=x, height=y, target_mask_fraction=target_masked_fraction,
+        cluster_shape=cluster_shape, cluster_prob=cluster_prob
     )
 
     # select centers
@@ -147,7 +198,9 @@ def create_mask_3d(
 def apply_mask_to_seismic(
     seismic_data: np.ndarray,
     mask: np.ndarray,
-    fill_value: float = 0.0
+    fill_value: float = 0.0,
+    fill_method: str = "zero",
+    noise_std: float = 1e-2,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Apply mask to seismic data.
@@ -155,15 +208,28 @@ def apply_mask_to_seismic(
     Args:
         seismic_data: 3D seismic array (x, y, z)
         mask: Boolean mask (True = preserve, False = mask)
-        fill_value: Value to fill masked positions (default: 0)
+        fill_value: Value to fill masked positions when fill_method="zero"
+        fill_method: Infill strategy for masked voxels: "zero" or "gaussian"
+        noise_std: Standard deviation for Gaussian infill with mean 0
     
     Returns:
         masked_data: Seismic data with masked positions filled
         original_data: Original full seismic data for reconstruction loss
         mask: Boolean mask used to identify masked voxels
     """
+    if fill_method not in ("zero", "gaussian"):
+        raise ValueError("fill_method must be one of: zero, gaussian")
+    if noise_std < 0:
+        raise ValueError("noise_std must be >= 0")
+
     masked_data = seismic_data.copy()
-    masked_data[~mask] = fill_value
+    if fill_method == "gaussian":
+        masked_count = int((~mask).sum())
+        if masked_count > 0:
+            noise = np.random.normal(loc=0.0, scale=float(noise_std), size=masked_count)
+            masked_data[~mask] = noise.astype(masked_data.dtype, copy=False)
+    else:
+        masked_data[~mask] = fill_value
     
     original_data = seismic_data.copy()
     return masked_data, original_data, mask

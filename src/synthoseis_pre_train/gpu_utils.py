@@ -1,11 +1,15 @@
 """GPU utility helpers for training and inference."""
 
 import contextlib
+import csv
+from datetime import datetime
 import os
 import platform
 import re
 import subprocess
-from typing import Dict, Optional
+import threading
+from pathlib import Path
+from typing import Dict, Optional, List, Any
 
 # Environment passed to all child processes — set Malloc* vars to "0" rather
 # than omitting them, so libmalloc sees an explicit disable signal.
@@ -22,6 +26,16 @@ _POWERMETRICS_SAMPLER: Optional[str] = None
 # Set to True after all sampler discovery fails so future calls skip subprocess
 # overhead entirely (stops the 12 fork+exec calls per thermal check cycle).
 _POWERMETRICS_UNAVAILABLE: bool = False
+_POWERMETRICS_GPU_UNAVAILABLE: bool = False
+
+
+def _as_text(value) -> str:
+    """Best-effort conversion of subprocess output to text."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def get_default_device(preferred: str = "auto") -> torch.device:
@@ -171,7 +185,7 @@ def get_cpu_temperature_c() -> Optional[float]:
                 out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
             except subprocess.TimeoutExpired as exc:
                 # Some builds stream indefinitely unless interrupted; parse what we got.
-                out = (exc.stdout or "") + ("\n" + exc.stderr if exc.stderr else "")
+                out = _as_text(exc.stdout) + ("\n" + _as_text(exc.stderr) if exc.stderr else "")
             except Exception:
                 continue
 
@@ -225,7 +239,7 @@ def get_thermal_pressure_level() -> Optional[str]:
             proc = subprocess.run(cmd, text=True, capture_output=True, timeout=4, env=_CLEAN_ENV)
             out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
         except subprocess.TimeoutExpired as exc:
-            out = (exc.stdout or "") + ("\n" + exc.stderr if exc.stderr else "")
+            out = _as_text(exc.stdout) + ("\n" + _as_text(exc.stderr) if exc.stderr else "")
         except Exception:
             continue
 
@@ -237,3 +251,219 @@ def get_thermal_pressure_level() -> Optional[str]:
             level = m.group(1).strip().capitalize()
             return level
     return None
+
+
+def get_system_gpu_percent() -> Optional[float]:
+    """Return best-effort system GPU activity percent on macOS, else None.
+
+    This is system-level GPU activity, not per-process usage.
+    """
+    global _POWERMETRICS_GPU_UNAVAILABLE
+    if platform.system() != "Darwin" or _POWERMETRICS_GPU_UNAVAILABLE:
+        return None
+
+    cmd_variants = [
+        ["sudo", "-n", "/usr/bin/powermetrics", "--samplers", "gpu_power", "--once"],
+        ["sudo", "-n", "/usr/bin/powermetrics", "--samplers", "gpu_power", "-n", "1", "-i", "1000"],
+        ["sudo", "-n", "/usr/bin/powermetrics", "--samplers", "gpu_power", "-i", "1000", "-n", "1"],
+    ]
+
+    for cmd in cmd_variants:
+        try:
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=4, env=_CLEAN_ENV)
+            out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+        except subprocess.TimeoutExpired as exc:
+            out = _as_text(exc.stdout) + ("\n" + _as_text(exc.stderr) if exc.stderr else "")
+        except Exception:
+            continue
+
+        msg = out.lower()
+        if "unrecognized sampler" in msg or "invalid sampler" in msg:
+            _POWERMETRICS_GPU_UNAVAILABLE = True
+            return None
+        if "unrecognized option" in msg and "--once" in msg:
+            continue
+
+        m = re.search(r"GPU[^\n:]*active[^\n:]*:\s*([0-9]+(?:\.[0-9]+)?)%", out, re.IGNORECASE)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                return None
+    return None
+
+
+def get_mps_allocated_gb(device: Optional[torch.device] = None) -> tuple[Optional[float], Optional[float]]:
+    """Return (current_allocated_gb, driver_allocated_gb) for MPS when available."""
+    try:
+        if device is not None and getattr(device, "type", None) != "mps":
+            return None, None
+        if not torch.backends.mps.is_available():
+            return None, None
+        if not hasattr(torch, "mps"):
+            return None, None
+
+        current = None
+        driver = None
+        if hasattr(torch.mps, "current_allocated_memory"):
+            current = float(torch.mps.current_allocated_memory()) / (1024.0 ** 3)
+        if hasattr(torch.mps, "driver_allocated_memory"):
+            driver = float(torch.mps.driver_allocated_memory()) / (1024.0 ** 3)
+        return current, driver
+    except Exception:
+        return None, None
+
+
+def _collect_process_tree_usage(root_pid: int, include_children: bool = True) -> tuple[int, float, float]:
+    """Return (process_count, cpu_percent_sum, rss_gb_sum) for a pid tree.
+
+    CPU percent uses the instantaneous %CPU reported by ps.
+    """
+    try:
+        proc = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,%cpu=,rss="],
+            text=True,
+            capture_output=True,
+            timeout=3,
+            env=_CLEAN_ENV,
+        )
+    except Exception:
+        return 0, 0.0, 0.0
+
+    rows = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            cpu = float(parts[2])
+            rss_kb = int(parts[3])
+        except Exception:
+            continue
+        rows.append((pid, ppid, cpu, rss_kb))
+
+    if not rows:
+        return 0, 0.0, 0.0
+
+    children: dict[int, list[int]] = {}
+    metrics: dict[int, tuple[float, int]] = {}
+    for pid, ppid, cpu, rss_kb in rows:
+        children.setdefault(ppid, []).append(pid)
+        metrics[pid] = (cpu, rss_kb)
+
+    if root_pid not in metrics:
+        return 0, 0.0, 0.0
+
+    selected = {root_pid}
+    if include_children:
+        stack = [root_pid]
+        while stack:
+            cur = stack.pop()
+            for ch in children.get(cur, []):
+                if ch not in selected:
+                    selected.add(ch)
+                    stack.append(ch)
+
+    cpu_sum = 0.0
+    rss_kb_sum = 0
+    for pid in selected:
+        cpu, rss_kb = metrics.get(pid, (0.0, 0))
+        cpu_sum += cpu
+        rss_kb_sum += rss_kb
+
+    rss_gb = float(rss_kb_sum) / (1024.0 ** 2)
+    return len(selected), cpu_sum, rss_gb
+
+
+class ProcessTreeCsvMonitor:
+    """Background process-tree monitor that appends one CSV row per interval."""
+
+    def __init__(
+        self,
+        root_pid: int,
+        csv_path: str,
+        interval_sec: float = 15.0,
+        include_children: bool = True,
+        device: Optional[torch.device] = None,
+    ):
+        self.root_pid = int(root_pid)
+        self.csv_path = Path(csv_path)
+        self.interval_sec = max(1.0, float(interval_sec))
+        self.include_children = bool(include_children)
+        self.device = device
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._warned_runtime_error = False
+        self._header = [
+            "timestamp",
+            "root_pid",
+            "process_count",
+            "cpu_percent_tree",
+            "memory_gb_tree",
+            "gpu_percent_system",
+            "gpu_mps_current_allocated_gb",
+            "gpu_mps_driver_allocated_gb",
+            "cpu_temp_c",
+            "thermal_pressure_level",
+        ]
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        write_header = (not self.csv_path.exists()) or self.csv_path.stat().st_size == 0
+        if write_header:
+            with self.csv_path.open("w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(self._header)
+
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, name="process-tree-csv-monitor", daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout_sec: float = 2.0) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(0.1, float(timeout_sec)))
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._write_row()
+            except Exception as exc:
+                # Never let monitoring crash the training process.
+                if not self._warned_runtime_error:
+                    print(f"Background monitor warning: row sampling failed ({exc})")
+                    self._warned_runtime_error = True
+            self._stop_event.wait(self.interval_sec)
+
+    def _write_row(self) -> None:
+        proc_count, cpu_pct, mem_gb = _collect_process_tree_usage(
+            self.root_pid,
+            include_children=self.include_children,
+        )
+        gpu_pct = get_system_gpu_percent()
+        mps_current_gb, mps_driver_gb = get_mps_allocated_gb(self.device)
+        temp_c = get_cpu_temperature_c()
+        pressure = get_thermal_pressure_level()
+
+        row = [
+            datetime.now().isoformat(timespec="seconds"),
+            self.root_pid,
+            proc_count,
+            round(cpu_pct, 3),
+            round(mem_gb, 6),
+            "" if gpu_pct is None else round(gpu_pct, 3),
+            "" if mps_current_gb is None else round(mps_current_gb, 6),
+            "" if mps_driver_gb is None else round(mps_driver_gb, 6),
+            "" if temp_c is None else round(temp_c, 3),
+            "" if pressure is None else pressure,
+        ]
+
+        try:
+            with self.csv_path.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(row)
+        except Exception:
+            # Keep training unaffected if monitor IO fails.
+            return
