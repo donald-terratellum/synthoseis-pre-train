@@ -21,6 +21,7 @@ __pycache__/
 *.tmp
 *.bak
 *.py.txt
+my_commands.txt
 cpu_mem_stats_*.csv
 purgatory/
 scripts/
