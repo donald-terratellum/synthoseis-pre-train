@@ -35,7 +35,11 @@ from synthoseis_pre_train.gpu_utils import (
     get_thermal_pressure_level,
     ProcessTreeCsvMonitor,
 )
-from synthoseis_pre_train.losses import SSIMMSELoss3D, CompositeClusterAwareLoss
+from synthoseis_pre_train.losses import (
+    SSIMMSELoss3D,
+    CompositeClusterAwareLoss,
+    SlidingWindowStatsLoss3D,
+)
 from synthoseis_pre_train.models import create_model, _MAMBA_AVAILABLE
 from synthoseis_pre_train.plotting import make_4panel_figure, make_crosssection_figure
 
@@ -652,6 +656,7 @@ def train_epoch(
     ema_update_every: int = 1,
     max_batches: int | None = None,
     return_details: bool = False,
+    args=None,  # TODO: remove this line to disable QC print statements
 ) -> float | dict:
     """
     Train for one epoch using a single merged train DataLoader.
@@ -777,6 +782,46 @@ def train_epoch(
                     torch.mps.empty_cache()
                 continue
             raise
+
+        ### TODO: remove block ----------- qc for batch -------------- start
+        if args is not None:  # TODO: remove this condition and the block to disable QC print statements
+            # QC block: report the already-scaled study losses so runtime logs make
+            # the effective weighting explicit (SSIM is shown after the 200x scale).
+            huber_criterion = nn.HuberLoss(delta=args.huber_delta, reduction="mean")  # TODO: remove line
+            huber_loss = _compute_masked_loss(  # TODO: remove line
+                huber_criterion,  # TODO: remove line
+                output.float(),  # TODO: remove line
+                target.float(),  # TODO: remove line
+                mask,  # TODO: remove line
+            )  # TODO: remove line
+            ssim_criterion = SSIMMSELoss3D(  # TODO: remove line
+                    data_range=args.ssim_data_range,  # TODO: remove line
+                    window_size=args.ssim_window_size,  # TODO: remove line
+                    sigma=args.ssim_sigma,  # TODO: remove line
+                    alpha=args.ssim_alpha,  # TODO: remove line
+                    min_valid_ratio=args.ssim_min_valid_ratio,  # TODO: remove line
+                ).to(device)  # TODO: remove line
+            ssim_loss = _compute_masked_loss(  # TODO: remove line - compute missing ssim_loss
+                ssim_criterion,  # TODO: remove line
+                output.float(),  # TODO: remove line
+                target.float(),  # TODO: remove line
+                mask,  # TODO: remove line
+            ) * args.ssim_alpha  # TODO: remove line - apply scaling factor
+            mse_criterion = nn.MSELoss()  # TODO: remove line
+            mse_loss = _compute_masked_loss(  # TODO: remove line
+                mse_criterion,  # TODO: remove line
+                output.float(),  # TODO: remove line
+                target.float(),  # TODO: remove line
+                mask,  # TODO: remove line
+            )  # TODO: remove line
+            print(  # TODO: remove line
+                f"         .. Batch {batch_idx + 1}/{target_batches}: \n"  # TODO: remove line
+                f"          . mse={mse_loss.item():.6f}, huber={huber_loss.item():.6f}, ssim(x200)={ssim_loss.item():.6f}\n"  # TODO: remove line
+                f"          . input  min/mean/max/std: {input_data.min().item():.3f}/{input_data.mean().item():.3f}/{input_data.max().item():.3f}/{input_data.std().item():.3f}\n"  # TODO: remove line
+                f"          . output min/mean/max/std: {output.min().item():.3f}/{output.mean().item():.3f}/{output.max().item():.3f}/{output.std().item():.3f}\n"  # TODO: remove line
+                f"          . target min/mean/max/std: {target.min().item():.3f}/{target.mean().item():.3f}/{target.max().item():.3f}/{target.std().item():.3f}\n"  # TODO: remove line
+            )  # TODO: remove line
+        ### TODO: remove block ----------- qc for batch -------------- end
 
         temp_c = None
         if thermal_guard is not None:
@@ -1008,7 +1053,7 @@ DEFAULT_ARRAY_KEYS = [
     # "seismicCubes_cumsum_29_degrees_normalized_augmented",
     # "seismicCubes_cumsum_5_degrees_normalized_augmented",
     "seismicCubes_cumsum_fullstack",
-    "seismicCubes_cumsum_fullstack_noise_free"
+    # "seismicCubes_cumsum_fullstack_noise_free"
 ]
 
 
@@ -1037,7 +1082,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=100,
                        help="Number of epochs")
     parser.add_argument("--loss_type", type=str, default="huber",
-                       choices=["mse", "huber", "ssim_mse"],
+                       choices=["mse", "huber", "ssim_mse", "sliding_stats"],
                        help="Loss function (default: huber)")
     parser.add_argument("--huber_delta", type=float, default=0.1,
                        help="Delta parameter for Huber loss (default: 0.1; only used when --loss_type=huber)")
@@ -1051,6 +1096,67 @@ def main():
                        help="Blend factor in [0,1] for mixed SSIM+MSE loss; 0=MSE, 1=SSIM (default: 1/6)")
     parser.add_argument("--ssim_min_valid_ratio", type=float, default=0.5,
                        help="Minimum local valid-mask support ratio for SSIM pooling in [0,1] (default: 0.5)")
+    parser.add_argument(
+        "--sliding_stats_window",
+        type=int,
+        nargs=3,
+        default=[9, 9, 9],
+        help="3D sliding-window size (z y x) for local stats loss (default: 9 9 9; only used when --loss_type=sliding_stats)",
+    )
+    parser.add_argument(
+        "--sliding_stats_mean_weight",
+        type=float,
+        default=1.0,
+        help="Weight for sliding-window mean MAE term (default: 1.0; only used when --loss_type=sliding_stats)",
+    )
+    parser.add_argument(
+        "--sliding_stats_std_weight",
+        type=float,
+        default=1.0,
+        help="Weight for sliding-window std-ratio term (default: 1.0; only used when --loss_type=sliding_stats)",
+    )
+    parser.add_argument(
+        "--sliding_stats_min_weight",
+        type=float,
+        default=1.0,
+        help="Weight for sliding-window minima MAE term (default: 1.0; only used when --loss_type=sliding_stats)",
+    )
+    parser.add_argument(
+        "--sliding_stats_max_weight",
+        type=float,
+        default=1.0,
+        help="Weight for sliding-window maxima MAE term (default: 1.0; only used when --loss_type=sliding_stats)",
+    )
+    parser.add_argument(
+        "--sliding_stats_mae_weight",
+        type=float,
+        default=1.0,
+        help="Weight for voxelwise MAE term (default: 1.0; only used when --loss_type=sliding_stats)",
+    )
+    parser.add_argument(
+        "--sliding_stats_mse_weight",
+        type=float,
+        default=1.0,
+        help="Weight for voxelwise MSE term (default: 1.0; only used when --loss_type=sliding_stats)",
+    )
+    parser.add_argument(
+        "--sliding_stats_eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon for local-std stabilization in sliding stats loss (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--sliding_stats_std_ratio_clip",
+        type=float,
+        default=10.0,
+        help="Clip magnitude for local std ratio target/pred in sliding stats loss (default: 10.0)",
+    )
+    parser.add_argument(
+        "--sliding_stats_all_voxels",
+        action="store_true",
+        default=False,
+        help="Apply sliding stats loss to all voxels instead of only valid-mask voxels",
+    )
     parser.add_argument(
         "--enable-cluster-loss",
         action="store_true",
@@ -1118,6 +1224,22 @@ def main():
                        help="Resume from checkpoint")
     parser.add_argument("--use_mamba", action="store_true",
                        help="Use U-Mamba hybrid blocks in encoder (requires CUDA + mamba_ssm; falls back to ResBlock3d on MPS/CPU)")
+    parser.add_argument(
+        "--pre_head_mode",
+        type=str,
+        default="identity",
+        choices=["identity", "norm", "norm_gelu"],
+        help=(
+            "Pre-head block applied to decoder features before the final 1x1 conv. "
+            "'identity': direct linear path (recommended for reconstruction — preserves "
+            "polarity and full feature range). "
+            "'norm': InstanceNorm3d only (affine=True). "
+            "'norm_gelu': InstanceNorm3d + GELU — soft-rectifies negative features, "
+            "suppressing the model's ability to predict negative amplitudes; "
+            "do NOT use for seismic reconstruction. "
+            "(default: identity)"
+        ),
+    )
     parser.add_argument("--thermal_max_c", type=float, default=85.0,
                        help="Pause when CPU temperature exceeds this in Celsius; set <=0 to disable")
     parser.add_argument("--thermal_cooldown_sec", type=int, default=300,
@@ -1274,7 +1396,9 @@ def main():
         input_channels=1,
         hidden_dims=(32, 64, 128, 256),
         spatial_size=tuple(args.sample_shape),
+        pre_head_mode=args.pre_head_mode,
     ).to(device)
+    print(f"Pre-head mode: {args.pre_head_mode}")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
@@ -1386,6 +1510,19 @@ def main():
             alpha=args.ssim_alpha,
             min_valid_ratio=args.ssim_min_valid_ratio,
         ).to(device)
+    elif args.loss_type == "sliding_stats":
+        criterion = SlidingWindowStatsLoss3D(
+            window_size=tuple(args.sliding_stats_window),
+            mean_weight=args.sliding_stats_mean_weight,
+            std_weight=args.sliding_stats_std_weight,
+            min_weight=args.sliding_stats_min_weight,
+            max_weight=args.sliding_stats_max_weight,
+            mae_weight=args.sliding_stats_mae_weight,
+            mse_weight=args.sliding_stats_mse_weight,
+            eps=args.sliding_stats_eps,
+            std_ratio_clip=args.sliding_stats_std_ratio_clip,
+            apply_to_all_voxels=args.sliding_stats_all_voxels,
+        ).to(device)
     else:
         criterion = nn.MSELoss()
     # Optionally wrap SSIM-MSE criterion in the composite cluster-aware loss.
@@ -1486,8 +1623,23 @@ def main():
             f"range={args.ssim_data_range:.4g}, alpha={args.ssim_alpha:.4g}, "
             f"min_valid_ratio={args.ssim_min_valid_ratio:.3g})"
         )
+    elif args.loss_type == "sliding_stats":
+        print(
+            "Loss: SlidingStats "
+            f"(window={tuple(args.sliding_stats_window)}, "
+            f"mean_weight={args.sliding_stats_mean_weight:.4g}, "
+            f"std_weight={args.sliding_stats_std_weight:.4g}, "
+            f"min_weight={args.sliding_stats_min_weight:.4g}, "
+            f"max_weight={args.sliding_stats_max_weight:.4g}, "
+            f"mae_weight={args.sliding_stats_mae_weight:.4g}, "
+            f"mse_weight={args.sliding_stats_mse_weight:.4g}, "
+            f"eps={args.sliding_stats_eps:.3g}, "
+            f"std_ratio_clip={args.sliding_stats_std_ratio_clip:.4g}, "
+            f"all_voxels={bool(args.sliding_stats_all_voxels)})"
+        )
     else:
         print(f"Loss: MSE")
+    print(f"Loss module: {criterion.__class__.__name__}")
     print(
         "Masking: "
         f"target_masked_fraction={args.target_masked_fraction:.4g}, "
@@ -1574,6 +1726,7 @@ def main():
                     grad_clip_norm=args.grad_clip_norm,
                     ema=ema,
                     ema_update_every=args.ema_update_every,
+                    args=args,  # TODO: remove to disable QC print statements
                 )
             else:
                 target_batches = max(1, int(args.train_batches_per_epoch))
@@ -1611,6 +1764,7 @@ def main():
                         ema_update_every=args.ema_update_every,
                         max_batches=remaining,
                         return_details=True,
+                        args=args,  # TODO: remove to disable QC print statements
                     )
                     chunk_batches = int(details["batches_processed"])
                     if chunk_batches <= 0:
