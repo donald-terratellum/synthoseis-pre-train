@@ -24,6 +24,11 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard import SummaryWriter
 
+try:
+    from torchinfo import summary as torchinfo_summary
+except Exception:
+    torchinfo_summary = None
+
 from synthoseis_pre_train.dataloader import create_dataloader
 from synthoseis_pre_train.gpu_utils import (
     get_default_device,
@@ -164,6 +169,121 @@ def _compute_masked_loss(
     # Otherwise assume the criterion expects flat 1D tensors of selected
     # voxels (pointwise losses like simple MSE). Use boolean indexing.
     return criterion(output[~mask], target[~mask])
+
+
+def _print_keras_like_model_summary(
+    model: nn.Module,
+    sample_shape: tuple[int, int, int],
+    device: torch.device,
+    show_trainable: bool = True,
+) -> None:
+    """Print a safe Keras-like summary without running a model forward pass.
+
+    This avoids hard crashes observed with torchinfo on some torch/macOS stacks.
+    """
+    del sample_shape  # kept for API compatibility
+
+    model_device = device
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        pass
+
+    print(f"Model summary (safe, no forward pass; device={model_device}):")
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+
+    print(f"  Total params:      {total_params:,}")
+    if show_trainable:
+        print(f"  Trainable params:  {trainable_params:,}")
+        print(f"  Non-trainable:     {non_trainable_params:,}")
+
+    # Compact per-module breakdown similar to a Keras-style layer table.
+    header = f"{'Layer (type)':<54} {'Output Shape':<18} {'Param #':>12}"
+    print(header)
+    print("-" * len(header))
+
+    shown = 0
+    for name, module in model.named_modules():
+        if name == "":
+            continue
+        own_params = sum(p.numel() for p in module.parameters(recurse=False))
+        if own_params == 0 and len(list(module.children())) > 0:
+            continue
+        cls_name = module.__class__.__name__
+        layer_name = f"{name} ({cls_name})"
+        shape = "-"
+        if hasattr(module, "out_channels"):
+            shape = f"(N,{getattr(module, 'out_channels')},D,H,W)"
+        elif hasattr(module, "num_features"):
+            shape = f"(N,{getattr(module, 'num_features')},D,H,W)"
+        print(f"{layer_name[:54]:<54} {shape:<18} {own_params:>12,}")
+        shown += 1
+        if shown >= 80:
+            print("... (truncated)")
+            break
+
+    if torchinfo_summary is not None:
+        print("  Note: torchinfo is installed, but forward-pass summary is disabled for stability.")
+
+
+def _print_keras_like_model_summary_full(
+    model: nn.Module,
+    sample_shape: tuple[int, int, int],
+    device: torch.device,
+    show_trainable: bool = True,
+) -> None:
+    """Print full torchinfo summary with real forward pass (debug-only mode)."""
+    print("Model summary FULL (debug mode; runs a real forward pass):")
+    print("  WARNING: This can be slow and may increase memory use or fail on some environments.")
+
+    if torchinfo_summary is None:
+        print("  torchinfo is not installed; skipping full summary.")
+        print("  Install with: pip install torchinfo")
+        return
+
+    # Keep the summary forward pass on CPU to avoid perturbing active accelerator state.
+    target_device = torch.device("cpu")
+    try:
+        original_device = next(model.parameters()).device
+    except StopIteration:
+        original_device = device
+
+    moved_to_cpu = original_device.type != "cpu"
+    if moved_to_cpu:
+        model.to(target_device)
+
+    ckpt_modules = [m for m in model.modules() if hasattr(m, "use_checkpoint")]
+    original_ckpt_flags = [getattr(m, "use_checkpoint") for m in ckpt_modules]
+    for m in ckpt_modules:
+        m.use_checkpoint = False
+
+    col_names = ("input_size", "output_size", "num_params")
+    if show_trainable:
+        col_names = ("input_size", "output_size", "num_params", "trainable")
+
+    input_size = (1, 1, int(sample_shape[0]), int(sample_shape[1]), int(sample_shape[2]))
+
+    try:
+        with torch.no_grad():
+            torchinfo_summary(
+                model,
+                input_size=input_size,
+                depth=8,
+                col_names=col_names,
+                row_settings=("depth", "var_names"),
+                device=str(target_device),
+                verbose=1,
+            )
+    except Exception as exc:
+        print(f"  WARNING: full model summary failed ({exc})")
+    finally:
+        for m, old in zip(ckpt_modules, original_ckpt_flags):
+            m.use_checkpoint = old
+        if moved_to_cpu:
+            model.to(original_device)
 
 
 class ThermalGuard:
@@ -1240,6 +1360,18 @@ def main():
             "(default: identity)"
         ),
     )
+    parser.add_argument(
+        "--print_model_summary",
+        action="store_true",
+        default=False,
+        help="Print safe static per-layer model summary at startup (no forward pass; production-safe)",
+    )
+    parser.add_argument(
+        "--print_model_summary_full",
+        action="store_true",
+        default=False,
+        help="DEBUG ONLY: print full torchinfo model summary via real forward pass (can be slow/unstable)",
+    )
     parser.add_argument("--thermal_max_c", type=float, default=85.0,
                        help="Pause when CPU temperature exceeds this in Celsius; set <=0 to disable")
     parser.add_argument("--thermal_cooldown_sec", type=int, default=300,
@@ -1399,6 +1531,20 @@ def main():
         pre_head_mode=args.pre_head_mode,
     ).to(device)
     print(f"Pre-head mode: {args.pre_head_mode}")
+    if args.print_model_summary:
+        _print_keras_like_model_summary(
+            model,
+            tuple(args.sample_shape),
+            device,
+            show_trainable=True,
+        )
+    if args.print_model_summary_full:
+        _print_keras_like_model_summary_full(
+            model,
+            tuple(args.sample_shape),
+            device,
+            show_trainable=True,
+        )
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
