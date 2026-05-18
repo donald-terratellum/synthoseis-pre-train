@@ -7,6 +7,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _rescale_zero_centered_to_unit(x: torch.Tensor, data_range: float) -> torch.Tensor:
+    """Map zero-centered amplitudes to [0, 1] using configured data range.
+
+    Assumes nominal input support is approximately [-data_range/2, data_range/2].
+    Values outside this range are clamped for SSIM stability.
+    """
+    y = x / float(data_range) + 0.5
+    return torch.clamp(y, 0.0, 1.0)
+
+
 class SSIMMSELoss3D(nn.Module):
     """Mixed zero-mean SSIM and MSE loss for 3D seismic volumes.
 
@@ -204,6 +214,11 @@ class SSIMMSELoss3D(nn.Module):
         pred32 = pred.float()
         target32 = target.float()
 
+        # SSIM assumes bounded dynamic range. Rescale seismic amplitudes from
+        # approximately [-data_range/2, data_range/2] to [0, 1].
+        pred32 = _rescale_zero_centered_to_unit(pred32, self.data_range)
+        target32 = _rescale_zero_centered_to_unit(target32, self.data_range)
+
         if valid_mask is None:
             mask = torch.ones_like(pred32, dtype=torch.float32)
         else:
@@ -223,7 +238,8 @@ class SSIMMSELoss3D(nn.Module):
         ey2 = self._blur3d(mask * target32 * target32) / norm
         exy = self._blur3d(mask * pred32 * target32) / norm
 
-        c2 = (self.k2 * self.data_range) ** 2
+        # Effective SSIM range is 1.0 after rescaling to [0, 1].
+        c2 = (self.k2 * 1.0) ** 2
         cs = (2.0 * exy + c2) / (ex2 + ey2 + c2 + self.eps)
 
         # Restrict aggregation to neighborhoods with enough valid support.
@@ -245,26 +261,360 @@ class SSIMMSELoss3D(nn.Module):
         return (1.0 - self.alpha) * mse + self.alpha * ssim_component
 
 
+class MONAIStyleSSIMMSELoss3D(nn.Module):
+    """MONAI-style 3D SSIM + MSE mixture.
+
+    This implementation follows MONAI's standard SSIM formulation with local
+    means and covariance terms (non-zero-mean aware), then blends it with MSE:
+
+            total = (1 - alpha) * mse + alpha * dssim
+
+        where dssim = 0.5 * (1 - ssim), so perfect structural similarity maps
+        to 0 and larger values are worse.
+
+    Defaults track MONAI SSIM defaults for stability constants and window size.
+    """
+
+    def __init__(
+        self,
+        data_range: float = 30.0,
+        win_size: int = 7,
+        k1: float = 0.01,
+        k2: float = 0.03,
+        alpha: float = 1.0 / 6.0,
+        min_valid_ratio: float = 0.5,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        if win_size < 3:
+            raise ValueError("win_size must be >= 3")
+        if data_range <= 0:
+            raise ValueError("data_range must be > 0")
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError("alpha must be in [0, 1]")
+        if not (0.0 <= min_valid_ratio <= 1.0):
+            raise ValueError("min_valid_ratio must be in [0, 1]")
+
+        self.data_range = float(data_range)
+        self.win_size = int(win_size)
+        self.k1 = float(k1)
+        self.k2 = float(k2)
+        self.alpha = float(alpha)
+        self.min_valid_ratio = float(min_valid_ratio)
+        self.eps = float(eps)
+
+        kernel = torch.ones((1, 1, self.win_size, self.win_size, self.win_size), dtype=torch.float32)
+        kernel = kernel / float(self.win_size ** 3)
+        self.register_buffer("w", kernel, persistent=False)
+        self.cov_norm = float(self.win_size ** 2) / float(self.win_size ** 2 - 1)
+
+    def _ssim_component(
+        self,
+        pred32: torch.Tensor,
+        target32: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if pred32.shape != target32.shape:
+            raise ValueError("pred and target must have identical shape")
+        if pred32.ndim != 5:
+            raise ValueError("expected tensors shaped [B, C, D, H, W]")
+
+        if valid_mask.shape != pred32.shape:
+            raise ValueError("valid_mask must match pred shape")
+
+        c = pred32.shape[1]
+        w = self.w.to(device=pred32.device, dtype=pred32.dtype).repeat(c, 1, 1, 1, 1)
+        conv = F.conv3d
+
+        x = pred32 * valid_mask
+        y = target32 * valid_mask
+
+        ux = conv(x, w, groups=c)
+        uy = conv(y, w, groups=c)
+        uxx = conv(x * x, w, groups=c)
+        uyy = conv(y * y, w, groups=c)
+        uxy = conv(x * y, w, groups=c)
+
+        vx = self.cov_norm * (uxx - ux * ux)
+        vy = self.cov_norm * (uyy - uy * uy)
+        vxy = self.cov_norm * (uxy - ux * uy)
+
+        # Effective SSIM range is 1.0 after rescaling to [0, 1].
+        c1 = (self.k1 * 1.0) ** 2
+        c2 = (self.k2 * 1.0) ** 2
+
+        numerator = (2.0 * ux * uy + c1) * (2.0 * vxy + c2)
+        denom = (ux * ux + uy * uy + c1) * (vx + vy + c2) + self.eps
+        ssim_map = numerator / denom
+
+        support = conv(valid_mask, w, groups=c)
+        support_mask = (support >= self.min_valid_ratio).to(dtype=ssim_map.dtype)
+        support_sum = support_mask.sum(dtype=torch.float32)
+
+        if support_sum <= 0:
+            ssim_score = torch.clamp(ssim_map.mean(dtype=torch.float32), min=-1.0, max=1.0)
+        else:
+            ssim_score = torch.clamp(
+                (ssim_map * support_mask).sum(dtype=torch.float32) / support_sum,
+                min=-1.0,
+                max=1.0,
+            )
+
+        return 0.5 * (1.0 - ssim_score)
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if pred.shape != target.shape:
+            raise ValueError("pred and target must have identical shape")
+        if pred.ndim != 5:
+            raise ValueError("expected tensors shaped [B, C, D, H, W]")
+
+        pred32 = pred.float()
+        target32 = target.float()
+
+        # Match custom SSIM path: rescale zero-centered seismic amplitudes to
+        # [0, 1] before both MSE and SSIM computation.
+        pred32 = _rescale_zero_centered_to_unit(pred32, self.data_range)
+        target32 = _rescale_zero_centered_to_unit(target32, self.data_range)
+
+        if valid_mask is None:
+            mask = torch.ones_like(pred32, dtype=torch.float32)
+        else:
+            if valid_mask.shape != pred.shape:
+                raise ValueError("valid_mask must match pred shape")
+            mask = valid_mask.to(dtype=torch.float32)
+
+        denom = mask.sum(dtype=torch.float32).clamp_min(1.0)
+        mse = (((pred32 - target32) ** 2) * mask).sum(dtype=torch.float32) / denom
+        if self.alpha <= 0.0:
+            return mse
+
+        ssim_component = self._ssim_component(pred32, target32, mask)
+        if self.alpha >= 1.0:
+            return ssim_component
+        return (1.0 - self.alpha) * mse + self.alpha * ssim_component
+
+
+class SlidingWindowStatsLoss3D(nn.Module):
+    """3D local-statistics loss using sliding-window mean and std terms.
+
+    The loss is additive:
+
+        total = (
+            mean_weight * L_mean
+            + std_weight * L_std
+            + min_weight * L_minima
+            + max_weight * L_maxima
+            + mae_weight * L_mae
+            + mse_weight * L_mse
+        )
+
+    where:
+    - L_mean is MAE between local sliding-window means of pred and target.
+    - L_std measures how far local std ratio (target/pred) deviates from 1.
+    - L_minima is MAE between local sliding-window minima of pred and target.
+    - L_maxima is MAE between local sliding-window maxima of pred and target.
+    - L_mae is voxelwise MAE between pred and target.
+    - L_mse is voxelwise MSE between pred and target.
+
+    Local statistics are computed with stride-1 avg pooling over a kernel
+    (default 9x9x9). When a valid mask is provided, local moments are computed
+    as masked moments (weighted by valid voxels) unless ``apply_to_all_voxels``
+    is enabled.
+    """
+
+    def __init__(
+        self,
+        window_size: tuple[int, int, int] = (9, 9, 9),
+        mean_weight: float = 1.0,
+        std_weight: float = 1.0,
+        min_weight: float = 1.0,
+        max_weight: float = 1.0,
+        mae_weight: float = 1.0,
+        mse_weight: float = 1.0,
+        eps: float = 1e-6,
+        std_ratio_clip: float = 10.0,
+        apply_to_all_voxels: bool = False,
+    ) -> None:
+        super().__init__()
+        if len(window_size) != 3:
+            raise ValueError("window_size must be a 3-tuple like (9, 9, 9)")
+        if any(int(k) <= 0 for k in window_size):
+            raise ValueError("window_size entries must be positive")
+        if (
+            mean_weight < 0
+            or std_weight < 0
+            or min_weight < 0
+            or max_weight < 0
+            or mae_weight < 0
+            or mse_weight < 0
+        ):
+            raise ValueError("all component weights must be non-negative")
+        if eps <= 0:
+            raise ValueError("eps must be > 0")
+        if std_ratio_clip <= 1.0:
+            raise ValueError("std_ratio_clip must be > 1")
+
+        self.window_size = tuple(int(k) for k in window_size)
+        self.mean_weight = float(mean_weight)
+        self.std_weight = float(std_weight)
+        self.min_weight = float(min_weight)
+        self.max_weight = float(max_weight)
+        self.mae_weight = float(mae_weight)
+        self.mse_weight = float(mse_weight)
+        self.eps = float(eps)
+        self.std_ratio_clip = float(std_ratio_clip)
+        self.apply_to_all_voxels = bool(apply_to_all_voxels)
+
+    def _pad(self, x: torch.Tensor) -> torch.Tensor:
+        kz, ky, kx = self.window_size
+        pz_l = (kz - 1) // 2
+        pz_r = kz - 1 - pz_l
+        py_l = (ky - 1) // 2
+        py_r = ky - 1 - py_l
+        px_l = (kx - 1) // 2
+        px_r = kx - 1 - px_l
+        return F.pad(x, (px_l, px_r, py_l, py_r, pz_l, pz_r), mode="replicate")
+
+    def _pool(self, x: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool3d(self._pad(x), kernel_size=self.window_size, stride=1)
+
+    def _masked_local_moments(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        wsum = self._pool(valid_mask).clamp_min(self.eps)
+        mean = self._pool(x * valid_mask) / wsum
+        ex2 = self._pool((x * x) * valid_mask) / wsum
+        var = (ex2 - mean * mean).clamp_min(0.0)
+        std = torch.sqrt(var + self.eps)
+        return mean, std
+
+    def _masked_local_extrema(
+        self,
+        x: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Build finite sentinels from batch range so masked-out voxels never
+        # dominate local extrema while staying numerically stable on MPS/CUDA.
+        x_min = x.amin()
+        x_max = x.amax()
+        span = (x_max - x_min).abs() + 1.0
+        very_pos = x_max + 10.0 * span
+        very_neg = x_min - 10.0 * span
+
+        valid_bool = valid_mask > 0.5
+        x_for_max = torch.where(valid_bool, x, very_neg)
+        x_for_min = torch.where(valid_bool, x, very_pos)
+
+        local_max = F.max_pool3d(self._pad(x_for_max), kernel_size=self.window_size, stride=1)
+        local_min = -F.max_pool3d(self._pad(-x_for_min), kernel_size=self.window_size, stride=1)
+
+        support = F.max_pool3d(self._pad(valid_mask), kernel_size=self.window_size, stride=1)
+        support = (support > 0).to(dtype=x.dtype)
+        local_max = torch.where(support > 0, local_max, torch.zeros_like(local_max))
+        local_min = torch.where(support > 0, local_min, torch.zeros_like(local_min))
+        return local_min, local_max, support
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if pred.shape != target.shape:
+            raise ValueError("pred and target must have identical shape")
+        if pred.ndim != 5:
+            raise ValueError("expected tensors shaped [B, C, D, H, W]")
+
+        pred32 = pred.float()
+        target32 = target.float()
+
+        if valid_mask is None or self.apply_to_all_voxels:
+            mask = torch.ones_like(pred32, dtype=torch.float32)
+        else:
+            if valid_mask.shape != pred.shape:
+                raise ValueError("valid_mask must match pred shape")
+            mask = valid_mask.to(dtype=torch.float32)
+
+        mean_pred, std_pred = self._masked_local_moments(pred32, mask)
+        mean_tgt, std_tgt = self._masked_local_moments(target32, mask)
+        min_pred, max_pred, extrema_support = self._masked_local_extrema(pred32, mask)
+        min_tgt, max_tgt, _ = self._masked_local_extrema(target32, mask)
+
+        # Sliding-window averaged MAE term.
+        mean_mae = torch.abs(mean_pred - mean_tgt)
+
+        # Local std-ratio term, stabilized and clipped to avoid blowups.
+        std_ratio = (std_tgt + self.eps) / (std_pred + self.eps)
+        std_ratio = torch.clamp(std_ratio, 1.0 / self.std_ratio_clip, self.std_ratio_clip)
+        std_ratio_penalty = torch.abs(std_ratio - 1.0)
+
+        # Local extrema alignment terms.
+        min_mae = torch.abs(min_pred - min_tgt)
+        max_mae = torch.abs(max_pred - max_tgt)
+
+        # Global voxelwise reconstruction terms.
+        mae_voxel = torch.abs(pred32 - target32)
+        mse_voxel = (pred32 - target32) ** 2
+
+        # Keep reduction aligned with valid voxels unless all-voxel mode is on.
+        if self.apply_to_all_voxels:
+            l_mean = mean_mae.mean(dtype=torch.float32)
+            l_std = std_ratio_penalty.mean(dtype=torch.float32)
+            l_min = min_mae.mean(dtype=torch.float32)
+            l_max = max_mae.mean(dtype=torch.float32)
+            l_mae = mae_voxel.mean(dtype=torch.float32)
+            l_mse = mse_voxel.mean(dtype=torch.float32)
+        else:
+            denom = mask.sum(dtype=torch.float32).clamp_min(1.0)
+            l_mean = (mean_mae * mask).sum(dtype=torch.float32) / denom
+            l_std = (std_ratio_penalty * mask).sum(dtype=torch.float32) / denom
+            extrema_denom = extrema_support.sum(dtype=torch.float32).clamp_min(1.0)
+            l_min = (min_mae * extrema_support).sum(dtype=torch.float32) / extrema_denom
+            l_max = (max_mae * extrema_support).sum(dtype=torch.float32) / extrema_denom
+            l_mae = (mae_voxel * mask).sum(dtype=torch.float32) / denom
+            l_mse = (mse_voxel * mask).sum(dtype=torch.float32) / denom
+
+        return (
+            self.mean_weight * l_mean
+            + self.std_weight * l_std
+            + self.min_weight * l_min
+            + self.max_weight * l_max
+            + self.mae_weight * l_mae
+            + self.mse_weight * l_mse
+        )
+
+
 class CompositeClusterAwareLoss(nn.Module):
-    """Composite loss that upweights traces near masked clusters.
+    """Composite loss that upweights traces with high masking density.
 
     This wrapper composes an existing 3D loss (e.g. :class:`SSIMMSELoss3D`) and
     creates a two-term objective:
 
         loss = base_weight * L_base + cluster_weight * L_cluster
 
-    where ``L_base`` is the original loss computed with the provided
-    ``valid_mask`` (or all voxels if none provided), and ``L_cluster`` is the
-    same loss but computed only over traces whose 2D neighborhood (after a
-    5x5 average filter) is > ``eps``.
+    where:
+    - ``L_base`` is the loss computed over traces with LOW masking density
+      (high proportion of valid voxels)
+    - ``L_cluster`` is the loss computed over traces with HIGH masking density
+      (high proportion of masked voxels)
+
+    This design targets the reconstruction of heavily-masked regions while
+    maintaining baseline reconstruction quality across sparsely-masked regions.
 
     Notes:
     - Expects model/target tensors shaped ``[B, C, D, H, W]``.
-    - Implements the 2D neighborhood smoothing using ``F.avg_pool2d`` so the
-      computation runs on the same device (GPU) as the tensors.
-    - The per-trace selection logic treats a trace as "masked" when all
-      depth voxels are invalid in the supplied ``valid_mask`` (or zero if
-      ``valid_mask`` is None).
+    - Per-trace masking density is computed as the median fraction of masked
+      voxels across all traces in the batch. Traces are then split at this
+      median for base vs. cluster weighting.
+        - Weight assignment is at the VOXEL level, not trace-level.
+        - Works with any masking strategy: geometric padding, sparse voxel masking, etc.
     """
 
     def __init__(
@@ -288,6 +638,91 @@ class CompositeClusterAwareLoss(nn.Module):
         self.base_weight = float(base_weight)
         self.cluster_weight = float(cluster_weight)
 
+    def _weight_masks(
+        self,
+        reference: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the base and cluster masks based on per-trace masking density.
+        
+        Instead of looking for completely masked traces, this method uses masking
+        DENSITY to identify regions:
+        - base_mask: Traces with LOW masking density (high proportion of valid voxels)
+        - cluster_mask: Traces with HIGH masking density (high proportion of masked voxels)
+        
+        This approach works with sparse voxel-level masking where no traces are
+        completely masked.
+        
+        Returns:
+            base_mask: Tensor of shape [B, C, D, H, W] = 1.0 for traces with low mask density
+            cluster_mask: Tensor of shape [B, C, D, H, W] = 1.0 for traces with high mask density
+        """
+        if reference.ndim != 5:
+            raise ValueError("expected tensors shaped [B, C, D, H, W]")
+
+        B, C, D, H, W = reference.shape
+        
+        if valid_mask is None:
+            # No mask provided: all voxels valid, uniform base weighting
+            base_mask = torch.ones((B, C, D, H, W), dtype=reference.dtype, device=reference.device)
+            cluster_mask = torch.zeros((B, C, D, H, W), dtype=reference.dtype, device=reference.device)
+        else:
+            if valid_mask.shape != reference.shape:
+                raise ValueError("valid_mask must match pred shape")
+            
+            # Compute per-trace masking density: fraction of MASKED (invalid) voxels
+            valid_mask_float = valid_mask.float()  # 1.0 = valid, 0.0 = masked
+            per_trace_valid_count = valid_mask_float.sum(dim=2)  # [B, C, H, W]: sum over D
+            per_trace_valid_fraction = per_trace_valid_count / D  # [B, C, H, W]: fraction in [0, 1]
+            
+            # Masking density = 1 - valid_fraction
+            # High density = many masked voxels, Low density = mostly valid
+            per_trace_mask_density = 1.0 - per_trace_valid_fraction  # [B, C, H, W]
+            
+            # Use median masking density as threshold to separate base from cluster regions
+            mask_density_flat = per_trace_mask_density.view(-1)
+            threshold = torch.median(mask_density_flat)
+            
+            # base_mask: traces with low masking density (below median)
+            base_mask_2d = (per_trace_mask_density[:, 0, :, :] <= threshold).float()  # [B, H, W]
+            base_mask_2d = base_mask_2d.view(B, 1, 1, H, W).expand(B, C, D, H, W)
+            
+            # cluster_mask: traces with high masking density (above median)
+            cluster_mask_2d = (per_trace_mask_density[:, 0, :, :] > threshold).float()  # [B, H, W]
+            cluster_mask_2d = cluster_mask_2d.view(B, 1, 1, H, W).expand(B, C, D, H, W)
+            
+            base_mask = base_mask_2d.to(dtype=reference.dtype)
+            cluster_mask = cluster_mask_2d.to(dtype=reference.dtype)
+        
+        return base_mask, cluster_mask
+
+    def diagnostic_weight_maps(
+        self,
+        reference: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return per-voxel weight maps for visualization and diagnostics.
+        
+        These maps show the actual weight emphasis applied to each voxel by the
+        composite loss:
+        - base_weight_map: Applied to traces with LOW masking density
+        - cluster_weight_map: Applied to traces with HIGH masking density
+        
+        The split between base and cluster is determined by the median masking
+        density across all traces in the batch.
+        
+        Args:
+            reference: Reference tensor of shape [B, C, D, H, W].
+            valid_mask: Optional mask of shape [B, C, D, H, W] indicating valid voxels.
+        
+        Returns:
+            Tuple of (base_weight_map, cluster_weight_map), both [B, C, D, H, W]
+        """
+        base_mask, cluster_mask = self._weight_masks(reference, valid_mask)
+        base_weight_map = self.base_weight * base_mask
+        cluster_weight_map = self.cluster_weight * cluster_mask
+        return base_weight_map, cluster_weight_map
+
     def forward(
         self,
         pred: torch.Tensor,
@@ -304,60 +739,19 @@ class CompositeClusterAwareLoss(nn.Module):
                 as valid for the base loss.
 
         Returns:
-            Scalar composite loss tensor.
+            Scalar composite loss tensor = base_weight * L_base + cluster_weight * L_cluster
         """
-        # Validate shapes like the inner loss does.
         if pred.shape != target.shape:
             raise ValueError("pred and target must have identical shape")
         if pred.ndim != 5:
             raise ValueError("expected tensors shaped [B, C, D, H, W]")
 
-        B, C, D, H, W = pred.shape
-
-        # Base loss uses the supplied valid_mask (converted to float)
-        if valid_mask is None:
-            base_mask = None
-        else:
-            if valid_mask.shape != pred.shape:
-                raise ValueError("valid_mask must match pred shape")
-            base_mask = valid_mask
-
+        base_mask, cluster_mask = self._weight_masks(pred, valid_mask)
+        
+        # Base loss: computed over base mask (all valid, non-padding regions)
         L_base = self.base(pred, target, valid_mask=base_mask)
-
-        # Derive a 2D trace-level mask where a trace is considered "masked"
-        # when ALL depth voxels are invalid (zero) in the provided valid_mask.
-        if valid_mask is None:
-            # No masked traces when no valid_mask is provided.
-            trace_all_masked = torch.zeros((B, H, W), dtype=pred.dtype, device=pred.device)
-        else:
-            # Collapse channel dimension first: [B, C, D, H, W] -> [B, D, H, W]
-            per_depth = valid_mask.to(dtype=pred.dtype).sum(dim=1)
-            # A voxel is valid if per_depth > eps; then a trace is fully masked
-            # when no depth voxel is valid.
-            depth_valid = per_depth > self.eps
-            trace_all_masked = (~depth_valid).all(dim=1).to(dtype=pred.dtype)
-
-        # Smooth the 2D trace map with an average-pool (kernel_size x kernel_size)
-        # to obtain neighborhood density in a GPU-friendly manner.
-        # Shape conv expects [B, C, H, W].
-        trace_map = trace_all_masked.unsqueeze(1)  # [B,1,H,W]
-        smoothed = F.avg_pool2d(
-            trace_map,
-            kernel_size=self.kernel_size,
-            stride=1,
-            padding=self.kernel_size // 2,
-            count_include_pad=False,
-        )
-        # smoothed: [B,1,H,W] -> drop channel
-        smoothed = smoothed.squeeze(1)
-
-        # Build cluster selection: True where smoothed density > eps
-        cluster_sel = (smoothed > self.eps)
-
-        # Construct a valid_mask selecting all voxels in selected traces.
-        # cluster_sel: [B, H, W] -> expand to [B, C, D, H, W]
-        cluster_mask = cluster_sel.view(B, 1, 1, H, W).expand(B, C, D, H, W).to(dtype=pred.dtype)
-
+        
+        # Cluster loss: computed over cluster mask (completely masked traces + neighbors)
         L_cluster = self.base(pred, target, valid_mask=cluster_mask)
-
+        
         return self.base_weight * L_base + self.cluster_weight * L_cluster
