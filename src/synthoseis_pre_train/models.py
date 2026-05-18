@@ -45,10 +45,10 @@ class ResBlock3d(nn.Module):
         super().__init__()
         # self.z_conv = nn.Conv3d(in_channels, out_channels, kernel_size=(3, 1, 1), padding=(1, 0, 0), bias=False)
         # self.conv1 = nn.Conv3d(in_channels, out_channels, 3, padding=1, bias=False)
-        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=(7, 1, 1), padding=(3, 0, 0), bias=False)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=(7, 5, 5), padding=(3, 2, 2), bias=False)
         self.norm1 = nn.InstanceNorm3d(out_channels, affine=True)
         # self.conv2 = nn.Conv3d(out_channels, out_channels, 3, padding=1, bias=False)
-        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=(7, 1, 1), padding=(3, 0, 0), bias=False)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=(7, 5, 5), padding=(3, 2, 2), bias=False)
         self.norm2 = nn.InstanceNorm3d(out_channels, affine=True)
         self.act = nn.GELU()
         self.proj = (
