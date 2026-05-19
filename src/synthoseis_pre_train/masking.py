@@ -35,9 +35,20 @@ def _prefilter_along_z(
 ) -> np.ndarray:
     """Prefilter seismic along z only, for extrema index detection."""
     kernel = _generate_triangular_kernel(kernel_length, kernel_power)
+
+    def _convolve_same_len(trace: np.ndarray) -> np.ndarray:
+        out = np.convolve(trace.astype(np.float64, copy=False), kernel, mode="same")
+        # numpy.convolve(mode="same") returns max(len(trace), len(kernel)).
+        # For short traces (len(trace) < len(kernel)), center-crop back to the
+        # original z-length so downstream boolean masks keep the expected shape.
+        if out.shape[0] != trace.shape[0]:
+            start = (out.shape[0] - trace.shape[0]) // 2
+            out = out[start:start + trace.shape[0]]
+        return out
+
     # Keep this temporary array float64 to match strict-neighbor comparisons.
     return np.apply_along_axis(
-        lambda trace: np.convolve(trace.astype(np.float64, copy=False), kernel, mode="same"),
+        _convolve_same_len,
         axis=0,
         arr=seismic_data,
     )
@@ -155,11 +166,8 @@ def create_mask_3d(
         else:
             work = prefiltered
 
-        # is_peak = (work[1:-1, :, :] > work[:-2, :, :]) & (work[1:-1, :, :] > work[2:, :, :])
-        # is_trough = (work[1:-1, :, :] < work[:-2, :, :]) & (work[1:-1, :, :] < work[2:, :, :])
-        is_peak = (work[1:-1, :, :] >= work[:-2, :, :]) & (work[1:-1, :, :] >= work[2:, :, :])
-        is_trough = (work[1:-1, :, :] <= work[:-2, :, :]) & (work[1:-1, :, :] <= work[2:, :, :])
-
+        is_peak = (work[1:-1, :, :] > work[:-2, :, :]) & (work[1:-1, :, :] > work[2:, :, :])
+        is_trough = (work[1:-1, :, :] < work[:-2, :, :]) & (work[1:-1, :, :] < work[2:, :, :])
         peaks_troughs = is_peak | is_trough
         mask[1:-1, :, :] = peaks_troughs
         mask[0, :, :] = False

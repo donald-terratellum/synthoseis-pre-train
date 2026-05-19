@@ -1340,14 +1340,56 @@ def main():
                        help="Update EMA every N optimizer steps (default: 1)")
     parser.add_argument("--sample_shape", type=int, nargs=3, default=[128, 128, 128],
                        help="Sample shape (x y z)")
+    parser.add_argument(
+        "--amplitude_transform",
+        type=str,
+        default="example_stdev_scaling",
+        choices=[
+            "example_stdev_scaling",
+            "dataset_quantile_scaling",
+            "histogram_equalization",
+            "standardize",
+            "quantile_normal",
+        ],
+        help=(
+            "Amplitude preprocessing mode: "
+            "example_stdev_scaling (per-example std scaling to target stdev), "
+            "dataset_quantile_scaling (derive/load per-zarr-key quantile->normal mapping from the full 3D array), or "
+            "histogram_equalization (joint histeq across all seismic keys)"
+        ),
+    )
+    parser.add_argument(
+        "--quantile_symmetry_mode",
+        type=str,
+        default="strict_odd",
+        choices=["strict_odd", "independent"],
+        help="Quantile-normal symmetry mode (default: strict_odd)",
+    )
+    parser.add_argument(
+        "--quantile_epsilon",
+        type=float,
+        default=1e-6,
+        help="Epsilon for quantile->normal mapping (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--transforms_group",
+        type=str,
+        default="transforms",
+        help="Zarr subgroup used for persisted transforms (default: transforms)",
+    )
     # NOTE: legacy `trace_mask_ratio` removed; use --target_masked_fraction instead
-    parser.add_argument("--target_masked_fraction", type=float, default=0.15,
+    parser.add_argument("--target_masked_fraction", "--target-masked-fraction", dest="target_masked_fraction", type=float, default=0.15,
                        help="Target final masked fraction after cluster size/probability effects (default: 0.15)")
-    parser.add_argument("--cluster_shape", type=int, default=3,
+    parser.add_argument("--cluster_shape", "--cluster-shape", dest="cluster_shape", type=int, default=3,
                        help="Odd cluster edge size for masking neighborhoods, e.g. 3, 5, 7 (default: 3)")
-    parser.add_argument("--center_selection_method", type=str, default="random_mixture",
+    parser.add_argument("--center_selection_method", "--center-selection-method", dest="center_selection_method", type=str, default="random_mixture",
                        choices=["random_mixture", "mitchell_best_candidate", "poisson_disc", "uniform_random"],
                        help="Cluster-center sampling method for masking (default: random_mixture)")
+    parser.add_argument("--mask_fill_method", "--mask-fill-method", dest="mask_fill_method", type=str, default="zero",
+                       choices=["zero", "gaussian"],
+                       help="Masked-voxel infill method (default: zero)")
+    parser.add_argument("--mask_noise_std", "--mask-noise-std", dest="mask_noise_std", type=float, default=1e-2,
+                       help="Std-dev for Gaussian mask infill when --mask_fill_method=gaussian (default: 1e-2)")
     parser.add_argument("--device", type=str, default="auto",
                        help="Device (auto, cuda, mps, cpu)")
     parser.add_argument("--resume", type=str, default=None,
@@ -1414,6 +1456,10 @@ def main():
         parser.error("--target_masked_fraction must be between 0 and 1")
     if args.cluster_shape <= 0 or args.cluster_shape % 2 == 0:
         parser.error("--cluster_shape must be a positive odd integer")
+    if args.mask_noise_std < 0:
+        parser.error("--mask_noise_std must be >= 0")
+    if args.quantile_epsilon <= 0:
+        parser.error("--quantile_epsilon must be > 0")
     if args.huber_delta <= 0:
         parser.error("--huber_delta must be > 0")
     if args.ssim_window_size < 3:
@@ -1649,9 +1695,16 @@ def main():
         pin_memory=(device.type == "cuda"),
         normalize=True,
         target_std=1.0,
+        amplitude_transform=args.amplitude_transform,
+        quantile_symmetry_mode=args.quantile_symmetry_mode,
+        quantile_epsilon=args.quantile_epsilon,
+        transforms_group=args.transforms_group,
         target_masked_fraction=args.target_masked_fraction,
         cluster_shape=args.cluster_shape,
         center_selection_method=args.center_selection_method,
+        mask_fill_method=args.mask_fill_method,
+        mask_noise_std=args.mask_noise_std,
+        enable_cluster_mask_expansion=bool(args.enable_cluster_loss),
         array_keys=args.array_keys,
     )
 
