@@ -934,9 +934,19 @@ def train_epoch(
                 target.float(),  # TODO: remove line
                 mask,  # TODO: remove line
             )  # TODO: remove line
+            mae_criterion = nn.L1Loss()  # TODO: remove line
+            mae_loss = _compute_masked_loss(  # TODO: remove line
+                mae_criterion,  # TODO: remove line
+                output.float(),  # TODO: remove line
+                target.float(),  # TODO: remove line
+                mask,  # TODO: remove line
+            )  # TODO: remove line
+            sliding_stats_part = ""  # TODO: remove line
+            if getattr(args, "loss_type", "") == "sliding_stats":  # TODO: remove line
+                sliding_stats_part = f",\n            sliding_stats={loss.item():.4f}"  # TODO: remove line
             print(  # TODO: remove line
                 f"         .. Batch {batch_idx + 1}/{target_batches}: \n"  # TODO: remove line
-                f"          . mse={mse_loss.item():.6f}, huber={huber_loss.item():.6f}, ssim(x200)={ssim_loss.item():.6f}\n"  # TODO: remove line
+                f"          . mse={mse_loss.item():.6f}, mae={mae_loss.item():.5f}, huber={huber_loss.item():.6f}{sliding_stats_part}, ssim(x200)={ssim_loss.item():.6f}\n"  # TODO: remove line
                 f"          . input  min/mean/max/std: {input_data.min().item():.3f}/{input_data.mean().item():.3f}/{input_data.max().item():.3f}/{input_data.std().item():.3f}\n"  # TODO: remove line
                 f"          . output min/mean/max/std: {output.min().item():.3f}/{output.mean().item():.3f}/{output.max().item():.3f}/{output.std().item():.3f}\n"  # TODO: remove line
                 f"          . target min/mean/max/std: {target.min().item():.3f}/{target.mean().item():.3f}/{target.max().item():.3f}/{target.std().item():.3f}\n"  # TODO: remove line
