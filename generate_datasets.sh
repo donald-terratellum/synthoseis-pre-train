@@ -187,13 +187,22 @@ if [[ ! -f "$SYNTHOSEIS_DIR/main.py" ]]; then
     exit 1
 fi
 
-if [[ ! -f "$CONFIG" && ! -f "$SYNTHOSEIS_DIR/$CONFIG" ]]; then
-    echo "ERROR: config '$CONFIG' not found." >&2
-    exit 1
+if [[ "$CONFIG" = /* ]]; then
+    if [[ ! -f "$CONFIG" ]]; then
+        echo "ERROR: config '$CONFIG' not found." >&2
+        exit 1
+    fi
+else
+    if [[ -f "$CONFIG" ]]; then
+        CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+    elif [[ -f "$SYNTHOSEIS_DIR/$CONFIG" ]]; then
+        CONFIG="$(cd "$SYNTHOSEIS_DIR/$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+    else
+        echo "ERROR: config '$CONFIG' not found." >&2
+        echo "       Looked in current directory and under --synthoseis-dir ('$SYNTHOSEIS_DIR')." >&2
+        exit 1
+    fi
 fi
-
-# Resolve config to an absolute path
-[[ "$CONFIG" = /* ]] || CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
 
 # ── main loop ─────────────────────────────────────────────────────────────────
 if [[ -z "$START_INDEX" ]]; then
