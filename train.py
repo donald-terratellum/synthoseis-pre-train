@@ -789,7 +789,7 @@ def train_epoch(
     ema_update_every: int = 1,
     max_batches: int | None = None,
     return_details: bool = False,
-    args=None,  # TODO: remove this line to disable QC print statements
+    args=None,
 ) -> float | dict:
     """
     Train for one epoch using a single merged train DataLoader.
@@ -811,6 +811,25 @@ def train_epoch(
     last_input = None
     last_output = None
     last_target = None
+
+    # Optional per-batch QC metrics for human-readable diagnostics.
+    qc_enabled = bool(args is not None and getattr(args, "enable_batch_qc_metrics", False))
+    qc_every = max(1, int(getattr(args, "batch_qc_every", 10))) if qc_enabled else 0
+    qc_huber = None
+    qc_ssim = None
+    qc_mse = None
+    qc_mae = None
+    if qc_enabled:
+        qc_huber = nn.HuberLoss(delta=args.huber_delta, reduction="mean")
+        qc_ssim = SSIMMSELoss3D(
+            data_range=args.ssim_data_range,
+            window_size=args.ssim_window_size,
+            sigma=args.ssim_sigma,
+            alpha=args.ssim_alpha,
+            min_valid_ratio=args.ssim_min_valid_ratio,
+        ).to(device)
+        qc_mse = nn.MSELoss()
+        qc_mae = nn.L1Loss()
 
     try:
         natural_batches = len(train_loader)
@@ -916,55 +935,25 @@ def train_epoch(
                 continue
             raise
 
-        ### TODO: remove block ----------- qc for batch -------------- start
-        if args is not None:  # TODO: remove this condition and the block to disable QC print statements
-            # QC block: report the already-scaled study losses so runtime logs make
-            # the effective weighting explicit (SSIM is shown after the 200x scale).
-            huber_criterion = nn.HuberLoss(delta=args.huber_delta, reduction="mean")  # TODO: remove line
-            huber_loss = _compute_masked_loss(  # TODO: remove line
-                huber_criterion,  # TODO: remove line
-                output.float(),  # TODO: remove line
-                target.float(),  # TODO: remove line
-                mask,  # TODO: remove line
-            )  # TODO: remove line
-            ssim_criterion = SSIMMSELoss3D(  # TODO: remove line
-                    data_range=args.ssim_data_range,  # TODO: remove line
-                    window_size=args.ssim_window_size,  # TODO: remove line
-                    sigma=args.ssim_sigma,  # TODO: remove line
-                    alpha=args.ssim_alpha,  # TODO: remove line
-                    min_valid_ratio=args.ssim_min_valid_ratio,  # TODO: remove line
-                ).to(device)  # TODO: remove line
-            ssim_loss = _compute_masked_loss(  # TODO: remove line - compute missing ssim_loss
-                ssim_criterion,  # TODO: remove line
-                output.float(),  # TODO: remove line
-                target.float(),  # TODO: remove line
-                mask,  # TODO: remove line
-            ) * args.ssim_alpha  # TODO: remove line - apply scaling factor
-            mse_criterion = nn.MSELoss()  # TODO: remove line
-            mse_loss = _compute_masked_loss(  # TODO: remove line
-                mse_criterion,  # TODO: remove line
-                output.float(),  # TODO: remove line
-                target.float(),  # TODO: remove line
-                mask,  # TODO: remove line
-            )  # TODO: remove line
-            mae_criterion = nn.L1Loss()  # TODO: remove line
-            mae_loss = _compute_masked_loss(  # TODO: remove line
-                mae_criterion,  # TODO: remove line
-                output.float(),  # TODO: remove line
-                target.float(),  # TODO: remove line
-                mask,  # TODO: remove line
-            )  # TODO: remove line
-            sliding_stats_part = ""  # TODO: remove line
-            if getattr(args, "loss_type", "") == "sliding_stats":  # TODO: remove line
-                sliding_stats_part = f",\n            sliding_stats={loss.item():.4f}"  # TODO: remove line
-            print(  # TODO: remove line
-                f"         .. Batch {batch_idx + 1}/{target_batches}: \n"  # TODO: remove line
-                f"          . mse={mse_loss.item():.6f}, mae={mae_loss.item():.5f}, huber={huber_loss.item():.6f}{sliding_stats_part}, ssim(x200)={ssim_loss.item():.6f}\n"  # TODO: remove line
-                f"          . input  min/mean/max/std: {input_data.min().item():.3f}/{input_data.mean().item():.3f}/{input_data.max().item():.3f}/{input_data.std().item():.3f}\n"  # TODO: remove line
-                f"          . output min/mean/max/std: {output.min().item():.3f}/{output.mean().item():.3f}/{output.max().item():.3f}/{output.std().item():.3f}\n"  # TODO: remove line
-                f"          . target min/mean/max/std: {target.min().item():.3f}/{target.mean().item():.3f}/{target.max().item():.3f}/{target.std().item():.3f}\n"  # TODO: remove line
-            )  # TODO: remove line
-        ### TODO: remove block ----------- qc for batch -------------- end
+        if qc_enabled and (((batch_idx + 1) % qc_every) == 0 or (batch_idx + 1) == target_batches):
+            with torch.no_grad():
+                out_det = output.detach().float()
+                tgt_det = target.detach().float()
+                huber_loss = _compute_masked_loss(qc_huber, out_det, tgt_det, mask)
+                ssim_loss = _compute_masked_loss(qc_ssim, out_det, tgt_det, mask) * args.ssim_alpha
+                mse_loss = _compute_masked_loss(qc_mse, out_det, tgt_det, mask)
+                mae_loss = _compute_masked_loss(qc_mae, out_det, tgt_det, mask)
+
+                sliding_stats_part = ""
+                if getattr(args, "loss_type", "") == "sliding_stats":
+                    sliding_stats_part = f",\n            sliding_stats={loss.item():.4f}"
+                print(
+                    f"         .. Batch {batch_idx + 1}/{target_batches}: \n"
+                    f"          . mse={mse_loss.item():.6f}, mae={mae_loss.item():.5f}, huber={huber_loss.item():.6f}{sliding_stats_part}, ssim(x200)={ssim_loss.item():.6f}\n"
+                    f"          . input  min/mean/max/std: {input_data.min().item():.3f}/{input_data.mean().item():.3f}/{input_data.max().item():.3f}/{input_data.std().item():.3f}\n"
+                    f"          . output min/mean/max/std: {output.min().item():.3f}/{output.mean().item():.3f}/{output.max().item():.3f}/{output.std().item():.3f}\n"
+                    f"          . target min/mean/max/std: {target.min().item():.3f}/{target.mean().item():.3f}/{target.max().item():.3f}/{target.std().item():.3f}\n"
+                )
 
         temp_c = None
         if thermal_guard is not None:
@@ -1229,6 +1218,18 @@ def main():
                        help="Loss function (default: huber)")
     parser.add_argument("--huber_delta", type=float, default=0.1,
                        help="Delta parameter for Huber loss (default: 0.1; only used when --loss_type=huber)")
+    parser.add_argument(
+        "--enable_batch_qc_metrics",
+        action="store_true",
+        default=False,
+        help="Enable per-batch QC metric recomputation and prints (default: disabled)",
+    )
+    parser.add_argument(
+        "--batch_qc_every",
+        type=int,
+        default=10,
+        help="When QC metrics are enabled, print them every N batches (default: 10)",
+    )
     parser.add_argument("--ssim_window_size", type=int, default=16,
                        help="3D SSIM Gaussian window size (default: 16; only used when --loss_type=ssim_mse)")
     parser.add_argument("--ssim_sigma", type=float, default=(16.0 / 6.0),
@@ -1475,6 +1476,8 @@ def main():
         parser.error("--quantile_epsilon must be > 0")
     if args.huber_delta <= 0:
         parser.error("--huber_delta must be > 0")
+    if args.batch_qc_every <= 0:
+        parser.error("--batch_qc_every must be > 0")
     if args.ssim_window_size < 3:
         parser.error("--ssim_window_size must be >= 3")
     if args.ssim_sigma <= 0:

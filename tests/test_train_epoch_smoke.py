@@ -1,6 +1,7 @@
 """Smoke tests for merged-loader training path."""
 
 import math
+from types import SimpleNamespace
 
 import torch
 from torch import nn
@@ -78,6 +79,52 @@ def test_train_epoch_smoke_with_merged_loader():
         grad_clip_norm=0.0,
         ema=None,
         ema_update_every=1,
+    )
+
+    assert math.isfinite(loss)
+    assert loss > 0.0
+
+
+def test_train_epoch_smoke_with_batch_qc_enabled():
+    device = torch.device("cpu")
+    model = _TinyModel().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
+
+    ds_a = _TinySeismicDataset(n=4)
+    ds_b = _TinySeismicDataset(n=4)
+    merged_loader = DataLoader(ConcatDataset([ds_a, ds_b]), batch_size=2, shuffle=True)
+
+    args = SimpleNamespace(
+        enable_batch_qc_metrics=True,
+        batch_qc_every=1,
+        huber_delta=0.1,
+        ssim_data_range=30.0,
+        ssim_window_size=7,
+        ssim_sigma=1.5,
+        ssim_alpha=1.0 / 6.0,
+        ssim_min_valid_ratio=0.5,
+        loss_type="mse",
+    )
+
+    loss = train_epoch(
+        model=model,
+        train_loader=merged_loader,
+        optimizer=optimizer,
+        criterion=criterion,
+        device=device,
+        scaler=None,
+        writer=None,
+        epoch=0,
+        output_dir=None,
+        train_paths=[],
+        val_paths=[],
+        thermal_guard=None,
+        grad_accum_steps=1,
+        grad_clip_norm=0.0,
+        ema=None,
+        ema_update_every=1,
+        args=args,
     )
 
     assert math.isfinite(loss)
