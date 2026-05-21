@@ -153,6 +153,8 @@ def _compute_masked_loss(
     mask: torch.Tensor,
 ) -> torch.Tensor:
     """Compute masked loss for either pointwise or 3D-structural criteria."""
+    _assert_mask_contract(output, target, mask)
+
     # Training uses ~mask voxels as supervised targets.
     valid_mask = (~mask).to(dtype=output.dtype)
 
@@ -182,6 +184,35 @@ def _compute_masked_loss(
         )
 
     return criterion(output[~mask], target[~mask])
+
+
+def _assert_mask_contract(
+    output: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+) -> None:
+    """Validate train-time mask semantics contract before loss dispatch."""
+    if not isinstance(output, torch.Tensor) or not isinstance(target, torch.Tensor) or not isinstance(mask, torch.Tensor):
+        raise TypeError("output, target, and mask must all be torch.Tensor instances")
+
+    if output.shape != target.shape:
+        raise ValueError(
+            f"output/target shape mismatch: output={tuple(output.shape)} target={tuple(target.shape)}"
+        )
+
+    if mask.shape != output.shape:
+        raise ValueError(
+            f"mask/output shape mismatch: mask={tuple(mask.shape)} output={tuple(output.shape)}"
+        )
+
+    if mask.dtype is not torch.bool:
+        raise TypeError(f"mask must have dtype torch.bool, got {mask.dtype}")
+
+    if output.device != target.device or output.device != mask.device:
+        raise ValueError(
+            f"output/target/mask must be on same device: output={output.device}, "
+            f"target={target.device}, mask={mask.device}"
+        )
 
 
 def _print_keras_like_model_summary(
