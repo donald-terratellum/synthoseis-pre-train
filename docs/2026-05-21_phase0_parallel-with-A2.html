@@ -81,8 +81,31 @@
         <li>[x] Deferred training tasks documented while A2 is active.</li>
         <li>[ ] Capture exact A1 final metrics from summary CSV.</li>
         <li>[ ] Add caveat for dataset prune/split drift.</li>
-        <li>[ ] Draft critic review notes and targeted tests.</li>
-        <li>[ ] Commit non-training Phase 0 artifacts.</li>
+        <li>[x] Draft critic review notes and targeted tests.</li>
+        <li>[ ] Commit Phase 0 critic notes and test-plan artifacts.</li>
+      </ul>
+
+      <h2>Constructive Critic Review Notes (Initial)</h2>
+      <ul>
+        <li>Mask semantics are split across modules and depend on inversion at the train boundary; this contract needs explicit enforcement.</li>
+        <li>Loss routing must fail fast for unsupported criterion signatures to prevent silent shape misuse.</li>
+        <li>Diagnostics and QC computations should remain isolated from the training hot path and backward graph.</li>
+        <li>Sparse-mask edge cases require robust denominator and neighborhood-validity guards.</li>
+        <li>Cluster-aware weighting should remain transparent, minimal, and test-backed.</li>
+      </ul>
+
+      <h2>Targeted Test Plan (No New train.py Run Required)</h2>
+      <ul>
+        <li>Run now: <code>pytest -q tests/test_losses.py</code></li>
+        <li>Run now: <code>pytest -q tests/test_masking_sampling.py</code></li>
+        <li>Run now: <code>pytest -q tests/test_loss_cluster_aware.py tests/test_loss_cluster_aware_extra.py</code></li>
+        <li>Run now: <code>pytest -q tests/test_train_epoch_smoke.py -k masked</code></li>
+      </ul>
+      <ul>
+        <li>Prepare <code>tests/test_compute_masked_loss_routing.py</code> for valid_mask routing and fail-fast coverage.</li>
+        <li>Prepare <code>tests/test_mask_semantics_contract.py</code> for semantic consistency checks.</li>
+        <li>Prepare <code>tests/test_mask_gradient_flow.py</code> for masked-region gradient behavior checks.</li>
+        <li>Prepare <code>tests/test_diagnostics_no_grad_separation.py</code> for diagnostics/backprop separation checks.</li>
       </ul>
 
       <div class="note">

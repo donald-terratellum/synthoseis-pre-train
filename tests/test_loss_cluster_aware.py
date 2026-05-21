@@ -5,7 +5,10 @@ from synthoseis_pre_train.losses import SSIMMSELoss3D, CompositeClusterAwareLoss
 
 def test_composite_cluster_aware_mse_equivalence():
     """When base criterion is pure MSE and predictions are constant,
-    composite should equal 1.0 for pred=0,target=1 tensors (mse=1).
+    composite should match the base loss value.
+
+    SSIMMSELoss3D internally rescales amplitudes, so a hard-coded numeric
+    expectation is brittle across valid implementation changes.
     """
     B, C, D, H, W = 1, 1, 3, 8, 8
     pred = torch.zeros((B, C, D, H, W), dtype=torch.float32)
@@ -21,7 +24,8 @@ def test_composite_cluster_aware_mse_equivalence():
     comp = CompositeClusterAwareLoss(base_criterion=base, kernel_size=5, eps=1e-6)
 
     L = comp(pred, target, valid_mask=valid_mask)
+    expected = base(pred, target, valid_mask=valid_mask)
 
-    # For pred=0, target=1, MSE per-voxel is 1. Composite weighted sum of
-    # two losses that both evaluate to 1 should equal 1.
-    assert torch.isclose(L, torch.tensor(1.0), atol=1e-6)
+    # With constant per-voxel error, weighted base/cluster terms should reduce
+    # to the same scalar as the base criterion under the same valid mask.
+    assert torch.isclose(L, expected, atol=1e-6)
