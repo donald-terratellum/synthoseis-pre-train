@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Training Artifact Diagnostic Report</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f3ed;
+      --panel: #ffffff;
+      --text: #1f2937;
+      --muted: #5b6472;
+      --accent: #1f6f8b;
+      --accent-2: #b35c1e;
+      --border: #d7d2c8;
+      --code-bg: #f3efe6;
+    }
+    body {
+      margin: 0;
+      font-family: Georgia, Cambria, "Times New Roman", serif;
+      background: linear-gradient(180deg, #fbfaf7 0%, var(--bg) 100%);
+      color: var(--text);
+      line-height: 1.6;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 40px 24px 56px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: 0 12px 30px rgba(31, 41, 55, 0.08);
+      padding: 28px;
+    }
+    h1, h2, h3 {
+      line-height: 1.2;
+      margin: 0 0 14px;
+    }
+    h1 {
+      font-size: 2.2rem;
+      color: var(--accent);
+    }
+    h2 {
+      font-size: 1.35rem;
+      margin-top: 28px;
+      color: var(--accent-2);
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+    h3 {
+      font-size: 1.05rem;
+      color: var(--accent);
+      margin-top: 18px;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin-bottom: 20px;
+    }
+    p, li { font-size: 1rem; }
+    ul, ol { margin: 10px 0 18px 24px; }
+    code {
+      background: var(--code-bg);
+      padding: 0.15rem 0.35rem;
+      border-radius: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    .lead {
+      font-size: 1.08rem;
+      padding: 16px 18px;
+      border-left: 4px solid var(--accent);
+      background: #f8fbfc;
+      border-radius: 10px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }
+    .note {
+      background: #fcfbf8;
+      border: 1px solid #e7e0d2;
+      border-radius: 12px;
+      padding: 16px 18px;
+    }
+    @media (min-width: 860px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>Training Artifact Diagnostic Report</h1>
+      <div class="meta">Date: 2026-05-13 | Scope: current augmentation, masking, loss, and training design for synthoseis-pre-train</div>
+
+      <p class="lead">
+        The model is learning to reconstruct the visible peak and trough anchors, but it is not learning to fill the interior waveform structure or laterally interpolate masked traces with enough fidelity. The current design gives strong supervision only at masked voxels, uses zero-fill for missing context, and relies on a voxelwise objective by default. Those choices favor local copy/zero behavior over coherent seismic infilling.
+      </p>
+
+      <h2>Observed Symptoms</h2>
+      <ul>
+        <li>Vertical stripe artifacts in the predicted seismic output.</li>
+        <li>Missing interior waveform structure between preserved peaks and troughs.</li>
+        <li>Thick layers that do not retain the vertical amplitude pattern seen in the label volume.</li>
+        <li>Predictions that appear concentrated on peak/trough values instead of interpolated or extrapolated seismic structure.</li>
+      </ul>
+
+      <h2>Most Likely Causes</h2>
+      <ol>
+        <li>The training loss is applied only where voxels are masked, so preserved traces do not contribute a corrective gradient.</li>
+        <li>The default objective is voxelwise Huber or MSE, which does not directly reward local structural continuity.</li>
+        <li>Masked inputs are zero-filled, which makes masked regions look similar to natural zero-crossings after normalization.</li>
+        <li>The masking scheme removes entire traces, so the network must infer both vertical waveform shape and lateral continuity from relatively sparse context.</li>
+        <li>The model and augmentations are not explicitly optimized for interpolation across masked traces or for reconstructing between extrema along the Z axis.</li>
+      </ol>
+
+      <div class="grid">
+        <div class="note">
+          <h3>Recommended Updates</h3>
+          <ol>
+            <li>Keep the masking concept, but change the learning target with a small auxiliary loss over all valid voxels.</li>
+            <li>Make the default objective structural, not only pointwise, by using a mixed SSIM plus MSE loss.</li>
+            <li>Stop using plain zero-fill as the only masked-value signal; use noise, learned mask tokens, or a separate mask channel.</li>
+            <li>Add a waveform-oriented auxiliary objective such as a frequency-domain or 1D trace-shape loss along Z.</li>
+            <li>Reduce the difficulty gap in the masking curriculum by starting easier and increasing cluster density over time.</li>
+          </ol>
+        </div>
+        <div class="note">
+          <h3>Alternative Approaches</h3>
+          <ol>
+            <li>Mask-token or MAE-style architecture with visible voxels plus explicit mask tokens.</li>
+            <li>Diffusion-based inpainting for a more expressive reconstruction objective.</li>
+            <li>Wavelet or spectral loss along Z to preserve seismic character between extrema.</li>
+            <li>Curriculum masking to ease the model into clustered trace recovery.</li>
+          </ol>
+        </div>
+      </div>
+
+      <h2>Priority 3 Note</h2>
+      <p>
+        The fill noise is injected after the sample has already been normalized or quantile-mapped in the dataloader, so <code>noise_scale=0.1</code> means roughly 0.1 of the post-transform standard deviation. I did not find a seismic paper that prescribes a universal 10x or 100x smaller fill-noise rule; MAE uses mask tokens with high masking ratios, BERT uses a masking scheme with learned masked representations, and stacked denoising autoencoders treat corruption level as a task choice rather than a fixed universal ratio.
+      </p>
+      <p>
+        References: <a href="https://arxiv.org/abs/2111.06377">Masked Autoencoders Are Scalable Vision Learners</a>, <a href="https://arxiv.org/abs/1810.04805">BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</a>, <a href="https://www.jmlr.org/papers/v11/vincent10a.html">Stacked Denoising Autoencoders: Learning Useful Representations in a Deep Network with a Local Denoising Criterion</a>.
+      </p>
+
+      <h2>Recommended Plan</h2>
+      <ol>
+        <li>Keep the current masking workflow, but add a nonzero auxiliary loss over visible voxels.</li>
+        <li>Switch the default reconstruction loss from pure voxelwise loss to a structural mixed loss.</li>
+        <li>Replace zero-fill with a fill strategy that cannot be confused with a real seismic zero.</li>
+        <li>Add a small trace-shape or spectral auxiliary term if the artifact persists.</li>
+        <li>If the results still collapse toward peak/trough-only prediction, move to a mask-token architecture or diffusion-based inpainting.</li>
+      </ol>
+
+      <h2>Risk Notes</h2>
+      <ul>
+        <li>Increasing the loss too aggressively on visible voxels can reduce the model's incentive to infer missing regions, so the auxiliary term should stay small.</li>
+        <li>Structural losses can improve visual continuity but may hide over-smoothing if used alone, so they should remain mixed with a pointwise term.</li>
+        <li>Changing the input fill strategy can alter convergence behavior, so it should be introduced with a clear ablation test.</li>
+      </ul>
+
+      <h2>Status</h2>
+      <p>This report captures the earlier diagnosis and is suitable for future implementation planning or follow-up review.</p>
+    </section>
+  </main>
+</body>
+</html>

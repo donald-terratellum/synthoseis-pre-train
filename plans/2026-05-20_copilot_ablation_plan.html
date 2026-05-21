@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Copilot Ablation Plan</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --ink: #1d2733;
+      --muted: #4a5b6f;
+      --accent: #0f6b5c;
+      --border: #d8e0ea;
+      --code-bg: #0f1720;
+      --code-ink: #d7e4f5;
+    }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #edf3f8 0%, var(--bg) 70%);
+      color: var(--ink);
+      font: 16px/1.55 "Avenir Next", "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    .wrap {
+      max-width: 1080px;
+      margin: 0 auto;
+      padding: 28px 18px 56px;
+    }
+    h1, h2, h3 {
+      line-height: 1.25;
+      margin: 0 0 10px;
+    }
+    h1 {
+      font-size: 2rem;
+      letter-spacing: 0.2px;
+      color: #103447;
+      margin-bottom: 14px;
+    }
+    h2 {
+      font-size: 1.35rem;
+      color: #1a3d52;
+      margin-top: 20px;
+    }
+    h3 {
+      font-size: 1.05rem;
+      color: #234d67;
+      margin-top: 14px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin-top: 14px;
+      box-shadow: 0 4px 14px rgba(15, 33, 53, 0.05);
+    }
+    p { margin: 8px 0; }
+    ul, ol { margin: 8px 0 8px 22px; }
+    li { margin: 4px 0; }
+    code {
+      background: #eef3f8;
+      border: 1px solid #d9e4ef;
+      border-radius: 6px;
+      padding: 0 6px;
+      font-family: Menlo, Consolas, Monaco, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      margin: 10px 0;
+      background: var(--code-bg);
+      color: var(--code-ink);
+      border: 1px solid #202e3f;
+      border-radius: 10px;
+      padding: 12px 14px;
+      overflow-x: auto;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.02);
+    }
+    pre code {
+      background: transparent;
+      border: none;
+      color: inherit;
+      padding: 0;
+      font-size: 0.9em;
+      line-height: 1.45;
+      white-space: pre;
+    }
+    .note {
+      border-left: 4px solid var(--accent);
+      background: #f2faf7;
+      color: #24463e;
+      padding: 10px 12px;
+      border-radius: 8px;
+      margin-top: 10px;
+    }
+    .grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 980px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Copilot Ablation Plan</h1>
+
+    <div class="card">
+      <h2>Scope</h2>
+      <p>Concrete run sheet and low-risk implementation plan for seismic reconstruction training on a Mac mini home lab.</p>
+    </div>
+
+    <div class="card">
+      <h2>Assumptions</h2>
+      <ol>
+        <li>24 GB unified memory on MPS.</li>
+        <li>8 active zarr datasets, each approximately 300x300x1500.</li>
+        <li>Dynamic refresh policy: add 2 datasets and remove 2 datasets each epoch.</li>
+        <li>Training crops are 128x128x128.</li>
+        <li>Goal: reduce mean drift and recover label-level variance.</li>
+        <li>Phase A through C run on current train.py.</li>
+        <li>Phase D needs small code additions in train.py and models.py.</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h2>Common Setup</h2>
+      <pre><code>export DATA_FOLDER=/path/to/your/zarr/root
+export RUN_ROOT=checkpoints/ablation_2026_05_20
+mkdir -p "$RUN_ROOT"</code></pre>
+      <h3>Recommended Base Knobs</h3>
+      <ul>
+        <li><code>batch_size=2</code></li>
+        <li><code>grad_accum_steps=16</code></li>
+        <li>effective batch size <code>32</code></li>
+        <li><code>train_batches_per_epoch=64..80</code></li>
+        <li><code>val_batches_per_epoch=24..32</code></li>
+      </ul>
+      <div class="note">Reason: improves optimization stability without exceeding memory and ensures broad sampling of rotating datasets.</div>
+    </div>
+
+    <div class="card">
+      <h2>Phase A: Locked Baseline + LR Bracket</h2>
+      <ol>
+        <li>Establish baseline under fixed normalization/range assumptions.</li>
+        <li>Compare <code>lr=5e-5</code> vs <code>lr=1e-4</code> with no other changes.</li>
+      </ol>
+      <h3>A1 Baseline (lr=5e-5)</h3>
+      <pre><code>python train.py --data_folder "$DATA_FOLDER" --dataset_glob "seismic__*/model_data.zarr" --output_dir "$RUN_ROOT/A1_lr5e5" --device mps --sample_shape 128 128 128 --batch_size 2 --grad_accum_steps 16 --epochs 20 --val_split_ratio 0.25 --train_batches_per_epoch 64 --val_batches_per_epoch 24 --amplitude_transform histogram_equalization --transforms_group transforms_histeq_lock --loss_type ssim_mse --ssim_data_range 30.0 --ssim_window_size 16 --ssim_sigma 2.6667 --ssim_alpha 0.1667 --ssim_min_valid_ratio 0.5 --target_masked_fraction 0.15 --cluster_shape 3 --center_selection_method random_mixture --mask_fill_method zero --lr 5e-5 --lr_schedule poly --lr_poly_power 0.9 --lr_min 1e-6 --lr_warmup_epochs 3 --lr_warmup_start_factor 0.1 --ema_decay 0.995 --ema_update_every 1 --grad_clip_norm 1.0 --pre_head_mode identity --thermal_max_c 85 --thermal_pressure_trip_level serious --monitor_interval_sec 300</code></pre>
+      <h3>A2 Baseline (lr=1e-4)</h3>
+      <pre><code>python train.py --data_folder "$DATA_FOLDER" --dataset_glob "seismic__*/model_data.zarr" --output_dir "$RUN_ROOT/A2_lr1e4" --device mps --sample_shape 128 128 128 --batch_size 2 --grad_accum_steps 16 --epochs 20 --val_split_ratio 0.25 --train_batches_per_epoch 64 --val_batches_per_epoch 24 --amplitude_transform histogram_equalization --transforms_group transforms_histeq_lock --loss_type ssim_mse --ssim_data_range 30.0 --ssim_window_size 16 --ssim_sigma 2.6667 --ssim_alpha 0.1667 --ssim_min_valid_ratio 0.5 --target_masked_fraction 0.15 --cluster_shape 3 --center_selection_method random_mixture --mask_fill_method zero --lr 1e-4 --lr_schedule poly --lr_poly_power 0.9 --lr_min 1e-6 --lr_warmup_epochs 3 --lr_warmup_start_factor 0.1 --ema_decay 0.995 --ema_update_every 1 --grad_clip_norm 1.0 --pre_head_mode identity --thermal_max_c 85 --thermal_pressure_trip_level serious --monitor_interval_sec 300</code></pre>
+    </div>
+
+    <div class="card">
+      <h2>Phase B: Drift-Control Loss Ablation</h2>
+      <ol>
+        <li>Reduce low-frequency mean drift.</li>
+        <li>Preserve polarity and structure.</li>
+      </ol>
+      <h3>B1 Conservative Sliding Stats</h3>
+      <pre><code>python train.py --data_folder "$DATA_FOLDER" --dataset_glob "seismic__*/model_data.zarr" --output_dir "$RUN_ROOT/B1_slide_conservative" --device mps --sample_shape 128 128 128 --batch_size 2 --grad_accum_steps 16 --epochs 20 --val_split_ratio 0.25 --train_batches_per_epoch 64 --val_batches_per_epoch 24 --amplitude_transform histogram_equalization --transforms_group transforms_histeq_lock --loss_type sliding_stats --sliding_stats_window 9 9 9 --sliding_stats_mean_weight 2.0 --sliding_stats_std_weight 1.0 --sliding_stats_min_weight 0.2 --sliding_stats_max_weight 0.2 --sliding_stats_mae_weight 0.3 --sliding_stats_mse_weight 0.3 --sliding_stats_eps 1e-6 --sliding_stats_std_ratio_clip 5.0 --target_masked_fraction 0.15 --cluster_shape 3 --center_selection_method random_mixture --mask_fill_method zero --lr 5e-5 --lr_schedule poly --lr_poly_power 0.9 --lr_min 1e-6 --lr_warmup_epochs 3 --ema_decay 0.995 --ema_update_every 1 --grad_clip_norm 1.0 --pre_head_mode identity --thermal_max_c 85 --thermal_pressure_trip_level serious --monitor_interval_sec 300</code></pre>
+      <h3>B2 Stronger Mean Anchoring</h3>
+      <pre><code>python train.py --data_folder "$DATA_FOLDER" --dataset_glob "seismic__*/model_data.zarr" --output_dir "$RUN_ROOT/B2_slide_mean_strong" --device mps --sample_shape 128 128 128 --batch_size 2 --grad_accum_steps 16 --epochs 20 --val_split_ratio 0.25 --train_batches_per_epoch 64 --val_batches_per_epoch 24 --amplitude_transform histogram_equalization --transforms_group transforms_histeq_lock --loss_type sliding_stats --sliding_stats_window 9 9 9 --sliding_stats_mean_weight 3.0 --sliding_stats_std_weight 1.2 --sliding_stats_min_weight 0.2 --sliding_stats_max_weight 0.2 --sliding_stats_mae_weight 0.3 --sliding_stats_mse_weight 0.3 --sliding_stats_eps 1e-6 --sliding_stats_std_ratio_clip 5.0 --target_masked_fraction 0.15 --cluster_shape 3 --center_selection_method random_mixture --mask_fill_method zero --lr 5e-5 --lr_schedule poly --lr_poly_power 0.9 --lr_min 1e-6 --lr_warmup_epochs 3 --ema_decay 0.995 --ema_update_every 1 --grad_clip_norm 1.0 --pre_head_mode identity --thermal_max_c 85 --thermal_pressure_trip_level serious --monitor_interval_sec 300</code></pre>
+    </div>
+
+    <div class="card">
+      <h2>Phase C: Variance-Recovery Ablation</h2>
+      <ol>
+        <li>Raise predicted std toward target std without ringing.</li>
+        <li>Tune std pressure and clipping.</li>
+      </ol>
+      <h3>C1 Moderate Variance Push</h3>
+      <pre><code>python train.py --data_folder "$DATA_FOLDER" --dataset_glob "seismic__*/model_data.zarr" --output_dir "$RUN_ROOT/C1_var_moderate" --device mps --sample_shape 128 128 128 --batch_size 2 --grad_accum_steps 16 --epochs 20 --val_split_ratio 0.25 --train_batches_per_epoch 64 --val_batches_per_epoch 24 --amplitude_transform histogram_equalization --transforms_group transforms_histeq_lock --loss_type sliding_stats --sliding_stats_window 9 9 9 --sliding_stats_mean_weight 2.5 --sliding_stats_std_weight 1.5 --sliding_stats_min_weight 0.2 --sliding_stats_max_weight 0.2 --sliding_stats_mae_weight 0.3 --sliding_stats_mse_weight 0.3 --sliding_stats_eps 1e-6 --sliding_stats_std_ratio_clip 4.0 --target_masked_fraction 0.15 --cluster_shape 3 --center_selection_method random_mixture --mask_fill_method zero --lr 5e-5 --lr_schedule poly --lr_poly_power 0.9 --lr_min 1e-6 --lr_warmup_epochs 3 --ema_decay 0.995 --ema_update_every 1 --grad_clip_norm 1.0 --pre_head_mode identity --thermal_max_c 85 --thermal_pressure_trip_level serious --monitor_interval_sec 300</code></pre>
+      <h3>C2 Strong Variance Push</h3>
+      <pre><code>python train.py --data_folder "$DATA_FOLDER" --dataset_glob "seismic__*/model_data.zarr" --output_dir "$RUN_ROOT/C2_var_strong" --device mps --sample_shape 128 128 128 --batch_size 2 --grad_accum_steps 16 --epochs 20 --val_split_ratio 0.25 --train_batches_per_epoch 64 --val_batches_per_epoch 24 --amplitude_transform histogram_equalization --transforms_group transforms_histeq_lock --loss_type sliding_stats --sliding_stats_window 9 9 9 --sliding_stats_mean_weight 2.5 --sliding_stats_std_weight 2.2 --sliding_stats_min_weight 0.2 --sliding_stats_max_weight 0.2 --sliding_stats_mae_weight 0.3 --sliding_stats_mse_weight 0.3 --sliding_stats_eps 1e-6 --sliding_stats_std_ratio_clip 3.0 --target_masked_fraction 0.15 --cluster_shape 3 --center_selection_method random_mixture --mask_fill_method zero --lr 5e-5 --lr_schedule poly --lr_poly_power 0.9 --lr_min 1e-6 --lr_warmup_epochs 3 --ema_decay 0.995 --ema_update_every 1 --grad_clip_norm 1.0 --pre_head_mode identity --thermal_max_c 85 --thermal_pressure_trip_level serious --monitor_interval_sec 300</code></pre>
+    </div>
+
+    <div class="card">
+      <h2>Phase D: Architecture Ablation for Sparse Inputs</h2>
+      <h3>Recommendations</h3>
+      <ol>
+        <li>Do not switch all residual blocks to strided convolutions.</li>
+        <li>Use mixed kernel sizes by depth: large shallow, compact deeper.</li>
+        <li>Keep UNet depth unchanged first, then revisit depth only after loss stabilization.</li>
+      </ol>
+      <h3>Required New CLI Flags</h3>
+      <ul>
+        <li><code>--block_type</code></li>
+        <li><code>--kernel_profile</code></li>
+        <li><code>--hidden_dims</code></li>
+      </ul>
+      <div class="note">Phase D command lines are in the Markdown version and can be run after these flags are implemented.</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Plan Improvements for Copilot</h2>
+        <ol>
+          <li>
+            Add reproducibility lock.
+            <ul>
+              <li>Context: rotating datasets and MPS thermals can create run-to-run variance that obscures true gains.</li>
+              <li>Goal: make A/B comparisons trustworthy for mean/std drift improvements.</li>
+              <li>Implementation:
+                <ul>
+                  <li>Add <code>--seed</code> and <code>--deterministic</code> in train.py.</li>
+                  <li>Seed <code>random</code>, <code>numpy</code>, and <code>torch</code> at startup.</li>
+                  <li>Enable deterministic torch mode when requested and log any fallbacks.</li>
+                  <li>Use deterministic dataloader seeding via generator plus worker_init_fn.</li>
+                  <li>Persist seed/deterministic flags in checkpoint metadata and TensorBoard run metadata.</li>
+                  <li>On resume, warn if runtime seed differs from checkpoint seed.</li>
+                  <li>Validation gate: repeat A1 with same seed and verify tight tolerance on final val loss and drift metrics.</li>
+                </ul>
+              </li>
+            </ul>
+          </li>
+          <li>
+            Add fixed validation holdout support.
+            <ul>
+              <li>Context: rotating train datasets can make validation trends non-stationary and hard to compare across runs.</li>
+              <li>Goal: keep a stable validation signal while still benefiting from dynamic train dataset refresh.</li>
+              <li>Implementation:
+                <ul>
+                  <li>Add <code>--val_paths_fixed</code> and <code>--train_paths_dynamic</code> arguments in train.py.</li>
+                  <li>Exclude fixed validation paths from pruning and train-side re-assignment logic.</li>
+                  <li>Apply add/drop policy only to the dynamic train pool.</li>
+                  <li>Print fixed validation set membership each epoch for traceability.</li>
+                </ul>
+              </li>
+            </ul>
+          </li>
+          <li>
+            Add drift metrics logging.
+            <ul>
+              <li>Context: primary failure mode is low-frequency mean drift and suppressed output variance.</li>
+              <li>Goal: monitor drift directly so model/loss changes can be judged against the real objective.</li>
+              <li>Implementation:
+                <ul>
+                  <li>Log global mean and std for prediction and target each epoch.</li>
+                  <li>Example:
+                    <ul>
+                      <li>TensorBoard keys: <code>drift/train/pred_mean</code>, <code>drift/train/pred_std</code>, <code>drift/train/target_mean</code>, <code>drift/train/target_std</code></li>
+                      <li>Sample log line: <code>epoch=7 pred_mean=0.031 pred_std=0.62 target_mean=0.002 target_std=0.98</code></li>
+                    </ul>
+                  </li>
+                  <li>Log pooled mean drift at multiple scales (for example kernel sizes 8 and 16).</li>
+                  <li>Example:
+                    <ul>
+                      <li>Compute pooled means with avg-pool kernels 8 and 16, then log <code>mean(abs(pool(pred)-pool(target)))</code>.</li>
+                      <li>TensorBoard keys: <code>drift/val/pooled_mean_drift_k8</code>, <code>drift/val/pooled_mean_drift_k16</code></li>
+                    </ul>
+                  </li>
+                  <li>Log std-ratio <code>std(pred)/std(target)</code> and track convergence toward 1.0.</li>
+                  <li>Write these as TensorBoard scalars for train and validation paths.</li>
+                </ul>
+              </li>
+            </ul>
+          </li>
+          <li>
+            Add optional low-frequency pooled-mean penalty in losses.
+            <ul>
+              <li>Context: local bias fields in large patches are not sufficiently constrained by current objective mix.</li>
+              <li>Goal: penalize low-frequency mean offsets without harming reflector detail.</li>
+              <li>Implementation:
+                <ul>
+                  <li>Extend losses.py with a pooled-mean L1 term and configurable pool size/weight.</li>
+                  <li>Support masked-only computation to align with supervised voxels policy.</li>
+                  <li>Add train.py CLI flags to enable and tune this term per run.</li>
+                  <li>Log the penalty component separately in TensorBoard for ablation clarity.</li>
+                </ul>
+              </li>
+            </ul>
+          </li>
+          <li>
+            Add phase-D architecture flags and print resolved kernel profile.
+            <ul>
+              <li>Context: architecture ablations should be reproducible without manual code edits between runs.</li>
+              <li>Goal: enable declarative, scriptable architecture experiments from CLI.</li>
+              <li>Implementation:
+                <ul>
+                  <li>Add args <code>--block_type</code>, <code>--kernel_profile</code>, and <code>--hidden_dims</code> in train.py.</li>
+                  <li>Example:
+                    <ul>
+                      <li>CLI: <code>--block_type anisotropic --kernel_profile mixed_large_shallow --hidden_dims 32 64 128 256</code></li>
+                      <li>Argparse sketch: <code>choices=["resblock","anisotropic"]</code> for <code>--block_type</code> and <code>nargs=4</code> for <code>--hidden_dims</code></li>
+                    </ul>
+                  </li>
+                  <li>Plumb these through create_model and model factory logic.</li>
+                  <li>Implement profile mapping in models.py (for example large-shallow and compact-deep).</li>
+                  <li>Example:
+                    <ul>
+                      <li><code>mixed_large_shallow</code>: stage0/1 kernels <code>(7,5,5)</code>, stage2/3 kernels <code>(3,3,3)</code></li>
+                      <li><code>compact_deep</code>: all stages <code>(3,3,3)</code> with optional anisotropic middle stages</li>
+                    </ul>
+                  </li>
+                  <li>Print per-stage resolved kernels/channels at startup and store in checkpoint metadata.</li>
+                  <li>Example:
+                    <ul>
+                      <li>Startup print: <code>profile=mixed_large_shallow stage_kernels=[(7,5,5),(7,5,5),(3,3,3),(3,3,3)] hidden_dims=[32,64,128,256]</code></li>
+                      <li>Checkpoint metadata keys: <code>model.block_type</code>, <code>model.kernel_profile</code>, <code>model.stage_kernels</code>, <code>model.hidden_dims</code></li>
+                    </ul>
+                  </li>
+                </ul>
+              </li>
+            </ul>
+          </li>
+          <li>Remove training QC TODO block that recomputes extra losses per batch.</li>
+        </ol>
+      </div>
+
+      <div class="card">
+        <h2>Home Lab Tuning Guidance</h2>
+        <ul>
+          <li>Keep <code>batch_size=2</code> on MPS.</li>
+          <li>Use <code>grad_accum_steps=12..16</code>.</li>
+          <li>Start with effective batch 32; reduce to 24 if wall time is too high.</li>
+          <li>Increase train batches 64 → 80 only if swap stays low and thermals are stable.</li>
+          <li>Keep validation batches in 24..32 range.</li>
+          <li>Keep <code>ema_decay=0.995</code> and polynomial LR schedule.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

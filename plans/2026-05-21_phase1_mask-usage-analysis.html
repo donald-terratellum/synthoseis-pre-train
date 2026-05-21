@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phase 1 Mask Usage Analysis</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --text: #1f2937;
+      --muted: #475569;
+      --line: #dbe4ef;
+      --accent: #0b6e4f;
+      --soft: #e7f5ef;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 15% -10%, #e6f0ff, var(--bg) 42%);
+      color: var(--text);
+      font-family: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 16px 56px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 22px;
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
+    }
+    h1 { margin: 0 0 10px; font-size: 1.9rem; }
+    h2 { margin-top: 24px; border-left: 4px solid var(--accent); padding-left: 10px; font-size: 1.18rem; }
+    p, li { color: var(--text); }
+    .meta { color: var(--muted); font-size: 0.95rem; margin-bottom: 12px; }
+    .note {
+      margin-top: 12px;
+      background: var(--soft);
+      border: 1px solid #bde5d5;
+      border-radius: 10px;
+      padding: 12px;
+    }
+    code {
+      font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
+      background: #f1f5f9;
+      padding: 0.08rem 0.28rem;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Phase 1 Mask Usage Analysis</h1>
+      <p class="meta">Date: 2026-05-21<br/>Branch: <code>feat/masking-loss-reevaluation</code><br/>Scope: Training-path mask behavior mapping while A2 ablation remains active.</p>
+
+      <h2>Executive Summary</h2>
+      <p>
+        Masking currently affects optimization directly, not only reporting. Mask generation and union happen in the dataloader,
+        semantic inversion occurs at the training loss boundary, and custom losses primarily use full-shape <code>valid_mask</code> inputs.
+        A fallback path still exists for criteria without <code>valid_mask</code> support.
+      </p>
+
+      <h2>A. Mask Usage Overall</h2>
+      <ol>
+        <li>Mask creation starts in <code>src/synthoseis_pre_train/masking.py</code> via <code>create_mask_3d</code>.</li>
+        <li>Source semantics are explicit: True preserve, False masked in <code>apply_mask_to_seismic</code>.</li>
+        <li>Dataloader applies masking to input only and keeps target unmasked.</li>
+        <li>Optional cluster expansion dilates blank-trace adjacency and reapplies masking.</li>
+        <li>Final mask is <code>trace_mask &amp; geom_mask</code>.</li>
+        <li>Training consumes mask via <code>_compute_masked_loss</code>.</li>
+      </ol>
+      <div class="note">Risk: dataloader comments and train-time inversion semantics need a single explicit contract to avoid drift.</div>
+
+      <h2>B. Mask Usage In Loss Computation</h2>
+      <ul>
+        <li><code>train.py::_compute_masked_loss</code> computes <code>valid_mask = ~mask</code>.</li>
+        <li>If criterion supports <code>valid_mask</code>, full-shape tensors are passed.</li>
+        <li>Fallback path uses boolean indexing <code>output[~mask], target[~mask]</code>.</li>
+      </ul>
+      <p>Mask-aware losses confirmed: <code>SSIMMSELoss3D</code>, <code>MONAIStyleSSIMMSELoss3D</code>, <code>SlidingWindowStatsLoss3D</code>, <code>CompositeClusterAwareLoss</code>.</p>
+
+      <h2>C. Mask Usage In Gradient Backpropagation</h2>
+      <ol>
+        <li>Train loop computes masked loss.</li>
+        <li>Backward is executed on scaled masked loss.</li>
+        <li>Gradients are clipped and optimizer steps on accumulation boundaries.</li>
+      </ol>
+      <p>
+        Masked regions are excluded where valid-mask weighting is zero. Composite cluster-aware loss shifts gradient emphasis by region.
+      </p>
+
+      <h2>D. Mask Usage Restricted To Diagnostics And QC</h2>
+      <ol>
+        <li>QC block in train loop recomputes additional masked losses for reporting.</li>
+        <li>Per-batch stats and figures are emitted for diagnostics.</li>
+        <li><code>plotting.py</code> consumes volumes and does not directly consume mask tensors.</li>
+      </ol>
+      <div class="note">Boundary concern: diagnostics should remain outside the hot path when possible to reduce overhead.</div>
+
+      <h2>E. MONAI 1.0.0 Pattern Comparison</h2>
+      <p>Alignment:</p>
+      <ul>
+        <li>Loss modules generally support explicit mask-aware full-shape contracts.</li>
+        <li>Masking and reduction are handled inside loss modules.</li>
+      </ul>
+      <p>Divergence:</p>
+      <ul>
+        <li>Runtime signature inspection plus fallback indexing is less explicit than fixed contracts.</li>
+        <li>QC recomputation in-train is more coupled than typical train-vs-metric separation.</li>
+        <li>Mask inversion at train boundary should be formalized in one contract.</li>
+      </ul>
+
+      <h2>Next Actions</h2>
+      <ol>
+        <li>Add <code>tests/test_compute_masked_loss_routing.py</code>.</li>
+        <li>Add <code>tests/test_mask_semantics_contract.py</code>.</li>
+        <li>Run targeted non-training test gate.</li>
+        <li>Commit docs plus new tests as Phase 1 checkpoint.</li>
+      </ol>
+    </div>
+  </div>
+</body>
+</html>

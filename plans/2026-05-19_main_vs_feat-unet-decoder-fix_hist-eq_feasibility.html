@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Feasibility Report: Partial Backport from feat/unet-decoder-fix</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --card: #ffffff;
+      --ink: #1e293b;
+      --muted: #475569;
+      --line: #dbe2ea;
+      --good: #0f766e;
+      --warn: #b45309;
+      --bad: #b91c1c;
+      --accent: #0b5cab;
+    }
+    body {
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #eaf1f7 0%, #f8fafc 50%, #f4f6f8 100%);
+    }
+    .wrap {
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 18px 24px;
+    }
+    .hero {
+      background: radial-gradient(circle at 10% 10%, #d8e8fb 0%, #ffffff 60%);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 18px 20px;
+      box-shadow: 0 6px 16px rgba(15, 23, 42, 0.06);
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 1.5rem;
+    }
+    h2 {
+      margin: 20px 0 10px;
+      font-size: 1.1rem;
+      color: #0f172a;
+    }
+    p, li {
+      line-height: 1.45;
+      color: var(--ink);
+    }
+    .muted {
+      color: var(--muted);
+      margin-top: 0;
+    }
+    .card {
+      margin-top: 16px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 14px 16px;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 0.95rem;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f8fafc;
+    }
+    .tag {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 10px;
+      font-size: 0.82rem;
+      font-weight: 600;
+      margin-right: 6px;
+    }
+    .good { background: #ccfbf1; color: #134e4a; }
+    .warn { background: #fef3c7; color: #78350f; }
+    .bad { background: #fee2e2; color: #7f1d1d; }
+    code {
+      background: #f1f5f9;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 1px 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.88rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>Feasibility Assessment: Input-Pipeline-Only Backport</h1>
+      <p class="muted">Date: 2026-05-19 | Source branch: <code>feat/unet-decoder-fix</code> | Target baseline: <code>main</code></p>
+      <p>
+        Objective: upgrade a new branch from <code>main</code> using only changes related to histogram-equalization and creation of augmented
+        128x128x128 training inputs, while excluding model architecture and loss-function changes.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Summary Decision</h2>
+      <p>
+        <span class="tag good">Feasible</span>
+        <span class="tag good">High Confidence</span>
+        A selective backport is practical and can be performed autonomously with a guarded scope.
+      </p>
+      <p>
+        Confidence rationale: the desired capability is primarily in data-input modules and train-argument wiring; model/loss changes are separable
+        by file-level exclusion and explicit commit/file filtering.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Branch Comparison Findings</h2>
+      <ul>
+        <li>Observed branch divergence includes data pipeline, masking/augmentation, train wiring, model architecture, and loss updates.</li>
+        <li>The desired histogram path is centered on <code>src/synthoseis_pre_train/histogram_equalizer.py</code> and associated dataloader/train integration.</li>
+        <li><code>train_multi_datasets.sh</code> has major flag-surface updates; only its input-pipeline and robustness changes should be ported.</li>
+        <li>Model and loss modifications exist in separate files and can be excluded from port scope.</li>
+      </ul>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Area</th>
+            <th>Representative Files</th>
+            <th>In Scope?</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Histogram equalization / nonlinear amplitude mapping</td>
+            <td><code>src/synthoseis_pre_train/histogram_equalizer.py</code></td>
+            <td><span class="tag good">Yes</span></td>
+            <td>Core requirement. Derive transform from full 3D dataset; apply per 128^3 sampled volumes.</td>
+          </tr>
+          <tr>
+            <td>Input sample generation and augmentation</td>
+            <td><code>src/synthoseis_pre_train/dataloader.py</code>, <code>src/synthoseis_pre_train/augmentation.py</code>, <code>src/synthoseis_pre_train/masking.py</code>, possibly <code>src/synthoseis_pre_train/transforms.py</code></td>
+            <td><span class="tag good">Yes</span></td>
+            <td>Primary backport surface for 128^3 handling and augmented sample creation.</td>
+          </tr>
+          <tr>
+            <td>Train CLI and dataloader wiring</td>
+            <td><code>train.py</code></td>
+            <td><span class="tag good">Yes</span></td>
+            <td>Needed to expose and route new transform options.</td>
+          </tr>
+          <tr>
+            <td>Training launcher script flags and safety hardening</td>
+            <td><code>train_multi_datasets.sh</code></td>
+            <td><span class="tag warn">Partial</span></td>
+            <td>Include only input-related flags (amplitude transform, masking, transform-group persistence) plus robust traps; exclude model/loss tuning flags.</td>
+          </tr>
+          <tr>
+            <td>Model architecture changes</td>
+            <td><code>src/synthoseis_pre_train/models.py</code>, <code>src/synthoseis_pre_train/dyn_models.py</code></td>
+            <td><span class="tag bad">No</span></td>
+            <td>Explicitly excluded.</td>
+          </tr>
+          <tr>
+            <td>Loss-function changes</td>
+            <td><code>src/synthoseis_pre_train/losses.py</code></td>
+            <td><span class="tag bad">No</span></td>
+            <td>Explicitly excluded.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Key Feasibility Risks and Mitigations</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Risk</th>
+            <th>Impact</th>
+            <th>Mitigation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>API drift between <code>main</code> and feature branch dataloader/train arguments</td>
+            <td>Runtime arg mismatch or silent defaults</td>
+            <td>Backport with explicit argument map and run smoke invocation using the same CLI profile as current training scripts.</td>
+          </tr>
+          <tr>
+            <td>Script-level flag coupling in <code>train_multi_datasets.sh</code></td>
+            <td>Forwarding unwanted model/loss options or missing required input flags</td>
+            <td>Port by hunk: keep transform/masking flags and diagnostic hardening; drop architecture/loss/SSIM-cluster option additions.</td>
+          </tr>
+          <tr>
+            <td>Transform persistence path differences in zarr stores</td>
+            <td>Repeated recomputation or missing metadata</td>
+            <td>Implement/read a stable transform metadata namespace and verify round-trip load/apply behavior.</td>
+          </tr>
+          <tr>
+            <td>Unintended model/loss code contamination</td>
+            <td>Behavioral regression outside scope</td>
+            <td>Restrict edits to allowlist files; fail task if staged changes include model/loss files.</td>
+          </tr>
+          <tr>
+            <td>Augmentation shape/order assumptions (axis order)</td>
+            <td>Incorrect sample orientation or masking mismatch</td>
+            <td>Add focused tests for shape/order invariants and mask alignment on 128^3 outputs.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Scope for a New Branch from main</h2>
+      <p>Recommended include set:</p>
+      <ul>
+        <li><code>src/synthoseis_pre_train/histogram_equalizer.py</code> (new module)</li>
+        <li>Input pipeline edits in <code>src/synthoseis_pre_train/dataloader.py</code>, <code>src/synthoseis_pre_train/augmentation.py</code>, <code>src/synthoseis_pre_train/masking.py</code></li>
+        <li>Optional transform helper module if required by branch API: <code>src/synthoseis_pre_train/transforms.py</code></li>
+        <li>CLI/wiring updates only in <code>train.py</code></li>
+        <li>Selective script updates in <code>train_multi_datasets.sh</code> for input-transform/masking flags and reliability traps only</li>
+        <li>Targeted tests for histogram mapping and 128^3 sample generation</li>
+      </ul>
+      <p>Recommended exclude set:</p>
+      <ul>
+        <li><code>src/synthoseis_pre_train/models.py</code>, <code>src/synthoseis_pre_train/dyn_models.py</code></li>
+        <li><code>src/synthoseis_pre_train/losses.py</code></li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Autonomy Readiness</h2>
+      <p>
+        Readiness for unassisted execution by agentic Copilot is <strong>high</strong> if constrained by file allowlist, tested with smoke checks,
+        and validated by diff guardrails before commit.
+      </p>
+      <p>
+        A companion execution plan was generated in markdown for direct assignment/use.
+      </p>
+    </section>
+  </div>
+</body>
+</html>

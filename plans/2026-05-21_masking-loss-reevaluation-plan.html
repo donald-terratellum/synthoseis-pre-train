@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Masking Loss Re-evaluation Plan</title>
+  <style>
+    :root {
+      --bg: #f7f6f3;
+      --panel: #ffffff;
+      --text: #1f2933;
+      --muted: #52606d;
+      --line: #d9e2ec;
+      --accent: #0b6e4f;
+      --accent-soft: #e6f4ef;
+      --warn: #9b1c1c;
+    }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", Helvetica, Arial, sans-serif;
+      background: radial-gradient(circle at 20% 0%, #eef7f3, var(--bg) 35%);
+      color: var(--text);
+      line-height: 1.55;
+    }
+    .wrap {
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 32px 18px 56px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 20px;
+      box-shadow: 0 6px 24px rgba(15, 23, 42, 0.05);
+    }
+    h1, h2, h3 {
+      margin-top: 0;
+      line-height: 1.2;
+    }
+    h1 {
+      font-size: 1.9rem;
+      letter-spacing: 0.01em;
+    }
+    h2 {
+      margin-top: 28px;
+      font-size: 1.3rem;
+      border-left: 5px solid var(--accent);
+      padding-left: 10px;
+    }
+    h3 {
+      margin-top: 20px;
+      font-size: 1.05rem;
+      color: #102a43;
+    }
+    p, li {
+      color: var(--text);
+    }
+    .meta {
+      color: var(--muted);
+      margin-bottom: 14px;
+      font-size: 0.95rem;
+    }
+    .note {
+      background: var(--accent-soft);
+      border: 1px solid #b7e4d4;
+      border-radius: 10px;
+      padding: 12px;
+      margin: 14px 0;
+    }
+    .risk {
+      color: var(--warn);
+      font-weight: 600;
+    }
+    code {
+      font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
+      background: #f0f4f8;
+      padding: 0.1rem 0.3rem;
+      border-radius: 4px;
+    }
+    ul {
+      margin-top: 8px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Masking Loss Re-evaluation Plan</h1>
+      <p class="meta">Date: 2026-05-21<br />Scope: Training pipeline masking behavior review and remediation, with MONAI 1.0.0 API/pattern comparison.</p>
+
+      <h2>Objective</h2>
+      <p>Re-evaluate whether non-standard masking and weighting in loss computation is the primary cause of weak training improvements, and isolate masking effects from architecture and data quality factors.</p>
+
+      <h2>Required Outcomes</h2>
+      <ul>
+        <li>Analyze mask usage overall in the training pipeline.</li>
+        <li>Analyze mask usage inside loss computation.</li>
+        <li>Analyze mask impact on back-propagation and gradient flow.</li>
+        <li>Analyze mask usage that is restricted to printed stats, diagnostics, and QC plots.</li>
+        <li>Compare current pipeline behavior to MONAI 1.0.0 training/loss masking patterns.</li>
+      </ul>
+
+      <h2>Constraints and Process Rules</h2>
+      <ul>
+        <li>Create and work on a new branch from local main.</li>
+        <li>Execute work in explicit phases.</li>
+        <li>Each phase must include constructive critic code review, tests written or updated, tests passing, and a git commit before proceeding.</li>
+        <li>Final phase must include end-to-end review, end-to-end testing, final commit, and a session summary in <code>.agentic-docs</code> as markdown and html.</li>
+      </ul>
+
+      <h2>Phase Plan</h2>
+
+      <h3>Phase 0: Branch, Baseline, and Reproducibility Lock</h3>
+      <p>Purpose: establish a stable reference so all mask changes are measurable.</p>
+      <ul>
+        <li>Create branch from local main: <code>feat/masking-loss-reevaluation</code>.</li>
+        <li>Freeze baseline config (dataset slice, seeds, epochs, loss type, mask params).</li>
+        <li>Capture baseline metrics and representative QC artifacts.</li>
+        <li>Record exact reproducibility commands.</li>
+      </ul>
+      <p><strong>Gate:</strong> targeted mask/loss tests and smoke run pass, then commit.</p>
+
+      <h3>Phase 1: Ground-truth Mask Usage Mapping</h3>
+      <p>Purpose: produce a complete, unambiguous mask map from data loading to reporting.</p>
+      <ul>
+        <li>Map where masks are created, transformed, expanded, and combined.</li>
+        <li>Map exact semantics at each boundary (True/False meaning).</li>
+        <li>Map all mask call sites in training logic.</li>
+        <li>Separate training-path usage from diagnostics-only usage.</li>
+      </ul>
+      <p><strong>Deliverables:</strong> markdown and html reports in plans folder.</p>
+      <p><strong>Gate:</strong> targeted semantics tests pass, then commit.</p>
+
+      <h3>Phase 2: Loss and Gradient Path Validation</h3>
+      <p>Purpose: verify whether masking changes optimization behavior in unintended ways.</p>
+      <ul>
+        <li>Trace all loss branches with mask inputs.</li>
+        <li>Validate reduction and normalization under variable valid-voxel counts.</li>
+        <li>Validate masked vs unmasked gradient behavior.</li>
+        <li>Validate sparse and empty-mask edge-case handling.</li>
+      </ul>
+      <p><strong>Gate:</strong> targeted routing/gradient stability tests pass, then commit.</p>
+
+      <h3>Phase 3: MONAI 1.0.0 API/Pattern Comparison</h3>
+      <p>Purpose: compare existing approach to MONAI-standard masked loss patterns and training/evaluation separation practices.</p>
+      <ul>
+        <li>Produce gap table: current behavior vs MONAI pattern.</li>
+        <li>Rank gaps by training-risk severity.</li>
+        <li>Define minimal and safe remediation order.</li>
+      </ul>
+      <p><strong>Gate:</strong> remediation tests pass, then commit.</p>
+
+      <h3>Phase 4: Mask Remediation Implementation</h3>
+      <p>Purpose: implement only high-value mask-related fixes first.</p>
+      <ul>
+        <li>Harden mask semantics and loss dispatch logic.</li>
+        <li>Isolate diagnostics-only masking from training hot path.</li>
+        <li>Remove redundant per-batch diagnostic loss recomputation from critical path when safe.</li>
+      </ul>
+      <p><strong>Gate:</strong> targeted tests and train epoch smoke pass, then commit.</p>
+
+      <h3>Phase 5: End-to-End Validation and Session Closeout</h3>
+      <p>Purpose: prove final integrated behavior and preserve traceability.</p>
+      <ul>
+        <li>Run end-to-end smoke plus selected convergence checks.</li>
+        <li>Validate no regression relative to baseline metric trends.</li>
+        <li>Perform final constructive critic review.</li>
+        <li>Write final summary in <code>.agentic-docs</code> (markdown and html).</li>
+      </ul>
+      <p><strong>Gate:</strong> end-to-end checks pass, then final commit.</p>
+
+      <h2>Proposed Targeted Test Matrix</h2>
+      <ul>
+        <li><code>tests/test_losses.py</code></li>
+        <li><code>tests/test_masking_sampling.py</code></li>
+        <li><code>tests/test_loss_cluster_aware.py</code></li>
+        <li><code>tests/test_train_epoch_smoke.py</code></li>
+        <li>New tests during execution:
+          <code>test_compute_masked_loss_routing.py</code>,
+          <code>test_mask_gradient_flow.py</code>,
+          <code>test_mask_semantics_contract.py</code>,
+          <code>test_diagnostics_no_grad_separation.py</code>
+        </li>
+      </ul>
+
+      <h2>Key Risks to Monitor</h2>
+      <ul>
+        <li><span class="risk">Inconsistent mask semantics across modules.</span></li>
+        <li><span class="risk">Loss routing fallback changing tensor-shape assumptions.</span></li>
+        <li><span class="risk">Sparse-mask numeric instability in local-window losses.</span></li>
+        <li><span class="risk">Diagnostic logic accidentally affecting training behavior or throughput.</span></li>
+      </ul>
+
+      <div class="note">
+        Confidence strategy: keep phase deltas small, require tests and commits per phase, use fail-fast behavior for unsupported mask/loss contracts, and defer non-mask architecture/data interventions unless mask analysis proves insufficient.
+      </div>
+
+      <h2>Open Questions to Ask During Execution If Needed</h2>
+      <ul>
+        <li>Exact baseline dataset subset and runtime budget.</li>
+        <li>Minimum acceptable metric drift threshold between phases.</li>
+        <li>Whether to escalate to full test suite at high-risk phase boundaries.</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>
