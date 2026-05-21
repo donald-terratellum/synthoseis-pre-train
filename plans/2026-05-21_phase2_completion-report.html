@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phase 2 Completion Report: Mask Gap Triage</title>
+  <style>
+    :root {
+      --bg: #f6faf8;
+      --card: #ffffff;
+      --text: #1f2a33;
+      --muted: #4b6472;
+      --line: #d8e5ea;
+      --accent: #0f766e;
+      --soft: #e9f8f4;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 12% -8%, #dff5ee, var(--bg) 42%);
+      color: var(--text);
+      font-family: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+      line-height: 1.58;
+    }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 16px 56px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 22px;
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
+    }
+    h1 { margin: 0 0 10px; font-size: 1.9rem; }
+    h2 { margin-top: 24px; border-left: 4px solid var(--accent); padding-left: 10px; font-size: 1.16rem; }
+    h3 { margin-top: 16px; font-size: 1.02rem; }
+    p, li { color: var(--text); }
+    .meta { color: var(--muted); font-size: 0.95rem; margin-bottom: 12px; }
+    .note {
+      margin-top: 12px;
+      background: var(--soft);
+      border: 1px solid #bde7de;
+      border-radius: 10px;
+      padding: 12px;
+    }
+    code {
+      font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
+      background: #f1f5f9;
+      padding: 0.08rem 0.28rem;
+      border-radius: 4px;
+    }
+    pre {
+      background: #f1f5f9;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Phase 2 Completion Report: Mask Gap Triage</h1>
+      <p class="meta">Date: 2026-05-21<br/>Branch: <code>feat/masking-loss-reevaluation</code><br/>Status: Complete (non-training validation gate passed)</p>
+
+      <h2>Executive Summary</h2>
+      <p>Phase 2 is complete. The mask contract and dispatch boundary were hardened, dispatcher compatibility was expanded with matrix coverage, QC overhead budget instrumentation was added, and fail-fast troubleshooting guidance was added to user-facing docs. The final non-training gate passed with 57 tests.</p>
+
+      <h2>Scope Completed</h2>
+      <ol>
+        <li>Contract assertion helper at loss boundary.</li>
+        <li>Dispatcher compatibility matrix test coverage.</li>
+        <li>QC overhead budget instrumentation and telemetry coverage.</li>
+        <li>Documentation ergonomics for fail-fast criterion routing errors.</li>
+      </ol>
+
+      <h2>Delivered Changes</h2>
+
+      <h3>1) Mask Contract Hardening</h3>
+      <ul>
+        <li>Added strict contract checks at the training loss boundary in <code>train.py</code> (shape, dtype, device consistency).</li>
+        <li>Added helpers: <code>_assert_mask_contract</code>, <code>_compute_qc_overhead_ratio</code>, <code>_is_qc_overhead_within_budget</code>.</li>
+      </ul>
+      <p>Evidence commit: <code>a46faf0</code> train+test: enforce mask contract at loss boundary</p>
+
+      <h3>2) Dispatcher Compatibility Matrix</h3>
+      <ul>
+        <li>Added <code>tests/test_masked_loss_dispatch_matrix.py</code> for valid-mask routing, pointwise fallback, explicit opt-in fallback, and fail-fast rejection.</li>
+      </ul>
+      <p>Evidence commit: <code>4cbb5c9</code> test: add masked-loss dispatcher compatibility matrix coverage</p>
+
+      <h3>3) QC Overhead Budget Instrumentation</h3>
+      <ul>
+        <li>Added QC telemetry fields in <code>train.py</code>: <code>qc_metrics_calls</code>, <code>qc_time_sec</code>, <code>total_batch_time_sec</code>, <code>qc_overhead_ratio</code>, <code>qc_overhead_budget_exceeded</code>.</li>
+        <li>Added CLI parameter <code>--batch_qc_max_overhead_ratio</code>.</li>
+        <li>Added deterministic helper tests in <code>tests/test_qc_overhead_budget.py</code>.</li>
+        <li>Extended smoke coverage in <code>tests/test_train_epoch_smoke.py</code>.</li>
+      </ul>
+      <p>Evidence commit: <code>4c75ac6</code> train+test: add QC overhead budget instrumentation and telemetry coverage</p>
+
+      <h3>4) Documentation Ergonomics (Item 5)</h3>
+      <ul>
+        <li>Added fail-fast troubleshooting guidance to <code>README.md</code> with safe fix paths and quick validation checklist.</li>
+        <li>Updated tracking docs: <code>plans/2026-05-21_phase2_mask-gap-triage.md</code> and <code>plans/2026-05-21_phase2_mask-gap-triage.html</code>.</li>
+      </ul>
+      <p>Evidence commit: <code>1cebb7b</code> docs: add fail-fast masked-loss troubleshooting and mark phase2 item5 complete</p>
+
+      <h2>Validation Evidence</h2>
+      <p>Final non-training Phase 2 gate command:</p>
+      <pre><code>.venv/bin/python -m pytest -q \
+tests/test_losses.py \
+tests/test_masking_sampling.py \
+tests/test_loss_cluster_aware.py \
+tests/test_loss_cluster_aware_extra.py \
+tests/test_compute_masked_loss_routing.py \
+tests/test_mask_semantics_contract.py \
+tests/test_train_epoch_smoke.py \
+tests/test_mask_contract_assertions.py \
+tests/test_masked_loss_dispatch_matrix.py \
+tests/test_qc_overhead_budget.py</code></pre>
+      <p>Result: 57 passed in 3.85s</p>
+
+      <div class="note">Operational constraint status: A2 training run remained undisturbed during Phase 2 implementation and validation.</div>
+
+      <h2>Residual Risks</h2>
+      <ol>
+        <li>Runtime signature inspection still exists in dispatcher logic; dynamic routing remains a maintenance risk.</li>
+        <li>QC overhead warning depends on observed timing and may require threshold tuning per environment.</li>
+        <li>Structural custom losses still require explicit valid_mask integration by implementers.</li>
+      </ol>
+
+      <h2>Phase 3 Recommendations</h2>
+      <ol>
+        <li>Replace signature inspection with explicit criterion capability contracts where practical.</li>
+        <li>Add a lightweight criterion registration matrix for supported routing modes.</li>
+        <li>Add environment-profiled QC overhead thresholds (CPU/MPS/CUDA presets).</li>
+        <li>Add a short contract reference in contributor-facing docs to reduce semantic drift.</li>
+      </ol>
+
+      <h2>Completion Decision</h2>
+      <p>Phase 2 goals are met. Proceed to Phase 3 contract simplification and maintainability hardening while preserving the current safety and test baseline.</p>
+    </div>
+  </div>
+</body>
+</html>
