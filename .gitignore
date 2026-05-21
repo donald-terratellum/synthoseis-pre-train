@@ -17,7 +17,7 @@ __pycache__/
 *.swp
 
 # agentic planning folder
-plans/
+# plans/
 
 # Logs and temporary files
 *.log
@@ -30,6 +30,7 @@ purgatory/
 scripts/
 
 # Training runtime artifacts
+checkpoints/
 checkpoints.run_*/
 checkpoints/partial_latest.pt
 checkpoints/thermal_latest.pt
