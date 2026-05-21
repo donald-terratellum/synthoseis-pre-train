@@ -166,8 +166,21 @@ def _compute_masked_loss(
         # Fall back to positional-call inspection if signature extraction fails.
         pass
 
-    # Otherwise assume the criterion expects flat 1D tensors of selected
-    # voxels (pointwise losses like simple MSE). Use boolean indexing.
+    # Flattened masked fallback is safe only for pointwise criteria.
+    # Custom criteria can explicitly opt-in by setting:
+    #   criterion.allow_mask_indexing = True
+    fallback_ok = isinstance(
+        criterion,
+        (nn.MSELoss, nn.L1Loss, nn.HuberLoss, nn.SmoothL1Loss),
+    ) or bool(getattr(criterion, "allow_mask_indexing", False))
+
+    if not fallback_ok:
+        raise ValueError(
+            f"Criterion {criterion.__class__.__name__} does not accept valid_mask and is not "
+            "approved for flattened masked fallback. Implement a forward(..., valid_mask=...) "
+            "signature or opt in with allow_mask_indexing=True for pointwise criteria."
+        )
+
     return criterion(output[~mask], target[~mask])
 
 

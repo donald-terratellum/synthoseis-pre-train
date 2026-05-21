@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -21,6 +22,7 @@ class _MaskAwareCriterion(nn.Module):
 class _FlatCriterion(nn.Module):
     def __init__(self):
         super().__init__()
+        self.allow_mask_indexing = True
         self.last_output_shape = None
         self.last_target_shape = None
 
@@ -67,3 +69,21 @@ def test_routing_falls_back_to_boolean_indexing_for_pointwise_loss():
     expected_count = int((~mask).sum().item())
     assert criterion.last_output_shape == (expected_count,)
     assert criterion.last_target_shape == (expected_count,)
+
+
+class _UnsupportedCriterion(nn.Module):
+    def forward(self, output, target):
+        # Structural placeholder criterion with no valid_mask support.
+        return ((output - target) ** 2).mean()
+
+
+def test_routing_fails_fast_for_unsupported_criterion_without_valid_mask():
+    output = torch.zeros((1, 1, 2, 3, 3), dtype=torch.float32)
+    target = torch.ones_like(output)
+    mask = torch.ones_like(output, dtype=torch.bool)
+    mask[:, :, :, 0, 0] = False
+
+    criterion = _UnsupportedCriterion()
+
+    with pytest.raises(ValueError, match="does not accept valid_mask"):
+        _compute_masked_loss(criterion, output, target, mask)
