@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phase 0 Parallel Execution (A2 Running)</title>
+  <style>
+    :root {
+      --bg: #f8fafc;
+      --card: #ffffff;
+      --text: #1e293b;
+      --muted: #475569;
+      --line: #dbe3ef;
+      --accent: #0f766e;
+      --soft: #e6f7f5;
+    }
+    body {
+      margin: 0;
+      background: linear-gradient(170deg, #eef5ff 0%, var(--bg) 45%);
+      color: var(--text);
+      font-family: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+      line-height: 1.55;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 26px 16px 48px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: 0 10px 22px rgba(2, 12, 27, 0.06);
+    }
+    h1 { margin: 0 0 10px; font-size: 1.8rem; }
+    h2 { margin-top: 24px; border-left: 4px solid var(--accent); padding-left: 10px; font-size: 1.2rem; }
+    p, li { color: var(--text); }
+    .meta { color: var(--muted); font-size: 0.95rem; margin-bottom: 14px; }
+    .note {
+      background: var(--soft);
+      border: 1px solid #bfe9e3;
+      border-radius: 10px;
+      padding: 12px;
+      margin-top: 10px;
+    }
+    code { background: #f1f5f9; padding: 0.08rem 0.28rem; border-radius: 4px; font-family: "IBM Plex Mono", Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Phase 0 Parallel Execution Plan (A2 Running)</h1>
+      <p class="meta">Date: 2026-05-21<br/>Branch: <code>feat/masking-loss-reevaluation</code><br/>Mode: Option 2 (keep A2 ablation running, perform non-training Phase 0 tasks now)</p>
+
+      <h2>Decision Record</h2>
+      <ul>
+        <li>A1 ablation completed and can serve as operational baseline evidence.</li>
+        <li>A2 ablation remains in progress and will not be interrupted yet.</li>
+        <li>Constraint: only one <code>train.py</code> instance can run on the Mac mini.</li>
+      </ul>
+
+      <h2>In Scope Now</h2>
+      <ul>
+        <li>Branch setup and workspace hygiene.</li>
+        <li>Baseline artifact inventory and traceability documentation.</li>
+        <li>Constructive critic review checklist preparation.</li>
+        <li>Targeted test-plan definition and non-training test scaffolding.</li>
+      </ul>
+
+      <h2>Deferred Until A2 Stops</h2>
+      <ul>
+        <li>Any new baseline/frozen-data <code>train.py</code> command.</li>
+        <li>Any training-side metric comparison requiring a fresh run.</li>
+      </ul>
+
+      <h2>Checklist</h2>
+      <ul>
+        <li>[x] Branch created from local main.</li>
+        <li>[x] Decision to reuse A1 as baseline evidence documented.</li>
+        <li>[x] Deferred training tasks documented while A2 is active.</li>
+        <li>[ ] Capture exact A1 final metrics from summary CSV.</li>
+        <li>[ ] Add caveat for dataset prune/split drift.</li>
+        <li>[ ] Draft critic review notes and targeted tests.</li>
+        <li>[ ] Commit non-training Phase 0 artifacts.</li>
+      </ul>
+
+      <div class="note">
+        Transition trigger: when A2 is stopped or completes, execute training-dependent Phase 0 checks and proceed to Phase 1 mask-path implementation.
+      </div>
+    </div>
+  </div>
+</body>
+</html>
