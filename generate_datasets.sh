@@ -98,7 +98,8 @@ parse_epoch_secs() {
     [[ "$timestr" =~ ([0-9]+)h ]] && h="${BASH_REMATCH[1]}"
     [[ "$timestr" =~ ([0-9]+)m ]] && m="${BASH_REMATCH[1]}"
     [[ "$timestr" =~ ([0-9]+)s ]] && s="${BASH_REMATCH[1]}"
-    echo $(( h*3600 + m*60 + s ))
+    # Force base-10 parsing so values like "09" are accepted.
+    echo $(( 10#$h*3600 + 10#$m*60 + 10#$s ))
 }
 
 # Format seconds → "2h 15m 20s" / "15m 20s" / "20s".

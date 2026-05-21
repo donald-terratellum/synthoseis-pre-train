@@ -16,6 +16,9 @@ __pycache__/
 .idea/
 *.swp
 
+# agentic planning folder
+plans/
+
 # Logs and temporary files
 *.log
 *.tmp
@@ -44,3 +47,4 @@ diagnostics/
 *.xls*
 *.ppt*
 *.csv
+copy_py_to_txt.sh
