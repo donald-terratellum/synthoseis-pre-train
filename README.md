@@ -236,6 +236,52 @@ Additional `train.py` options:
 | `--ema_decay` | `0.999` | EMA decay (`<=0` disables EMA) |
 | `--ema_update_every` | `1` | EMA update cadence in optimizer steps |
 
+### Troubleshooting masked-loss routing errors
+
+If training fails with an error similar to:
+
+`Criterion <Name> does not accept valid_mask and is not approved for flattened masked fallback.`
+
+this is an intentional fail-fast guard in the training loss dispatcher. It prevents
+structural losses from silently using flattened boolean indexing, which can break
+spatial semantics.
+
+Use one of these fixes:
+
+1. Preferred: implement a mask-aware criterion signature
+
+  Add `valid_mask` support to your criterion so full-shape tensors are preserved:
+
+  `forward(self, output, target, valid_mask=None)`
+
+  Inside the loss, apply `valid_mask` during reduction/weighting.
+
+2. Use a pointwise criterion
+
+  Pointwise losses are approved for flattened masked fallback:
+
+  - `torch.nn.MSELoss`
+  - `torch.nn.L1Loss`
+  - `torch.nn.HuberLoss`
+  - `torch.nn.SmoothL1Loss`
+
+3. Explicit opt-in for custom pointwise criteria only
+
+  If a custom criterion is truly pointwise-safe, opt in explicitly:
+
+  `criterion.allow_mask_indexing = True`
+
+  Do not use this opt-in for structural losses (for example SSIM/windowed/patch losses),
+  because flattening discards neighborhood structure.
+
+Quick check list when this error appears:
+
+1. Confirm mask, output, and target shapes match.
+2. Confirm mask dtype is boolean.
+3. For structural losses, add `valid_mask` support instead of opt-in fallback.
+4. Re-run focused gate:
+  `.venv/bin/python -m pytest -q tests/test_compute_masked_loss_routing.py tests/test_mask_semantics_contract.py tests/test_masked_loss_dispatch_matrix.py`
+
 ### Recommended presets
 
 Use these presets with `train_multi_datasets.sh` as a starting point, then tune from there.

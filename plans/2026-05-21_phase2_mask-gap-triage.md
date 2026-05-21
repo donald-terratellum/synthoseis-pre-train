@@ -73,6 +73,27 @@ Convert Phase 1 findings into an ordered remediation backlog with explicit accep
 3. QC overhead budget instrumentation and tests.
 4. Documentation and ergonomics polish.
 
+## Progress Update (2026-05-21)
+
+Completed in code and tests:
+
+1. Item 1 complete: mask contract assertion helper added at training loss boundary.
+2. Item 2 complete: dispatcher compatibility matrix test coverage added.
+3. Item 3 complete: QC overhead budget instrumentation added with deterministic helper tests.
+
+Validation status:
+
+- Focused Phase 2 suite passed: 23 tests.
+- A2 training process remained undisturbed.
+
+Remaining in this phase:
+
+1. Run full required non-training gate including baseline suites and all new Phase 2 suites.
+
+Item 5 status:
+
+- Complete: actionable fail-fast masked-loss troubleshooting guidance added to README training docs.
+
 ## Test Gate For Phase 2 Completion
 
 Required non-training suite:
@@ -101,7 +122,7 @@ Gate condition:
 
 1. Code updates for contract assertions and dispatch matrix coverage.
 2. QC budget instrumentation and test(s).
-3. Updated docs with explicit troubleshooting and contract guidance.
+3. Updated docs with explicit troubleshooting and contract guidance. (complete)
 4. Phase 2 completion report artifact.
 
 ## Out Of Scope
