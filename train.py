@@ -215,6 +215,18 @@ def _assert_mask_contract(
         )
 
 
+def _compute_qc_overhead_ratio(qc_time_sec: float, total_batch_time_sec: float) -> float:
+    """Return QC overhead ratio in [0, +inf), guarded for degenerate timings."""
+    if total_batch_time_sec <= 0:
+        return 0.0
+    return max(0.0, float(qc_time_sec) / float(total_batch_time_sec))
+
+
+def _is_qc_overhead_within_budget(overhead_ratio: float, max_ratio: float) -> bool:
+    """Check whether observed QC overhead ratio is within configured budget."""
+    return float(overhead_ratio) <= float(max_ratio)
+
+
 def _print_keras_like_model_summary(
     model: nn.Module,
     sample_shape: tuple[int, int, int],
@@ -846,10 +858,14 @@ def train_epoch(
     # Optional per-batch QC metrics for human-readable diagnostics.
     qc_enabled = bool(args is not None and getattr(args, "enable_batch_qc_metrics", False))
     qc_every = max(1, int(getattr(args, "batch_qc_every", 10))) if qc_enabled else 0
+    qc_budget_ratio = float(getattr(args, "batch_qc_max_overhead_ratio", 1.0)) if qc_enabled else 0.0
     qc_huber = None
     qc_ssim = None
     qc_mse = None
     qc_mae = None
+    qc_time_sec_total = 0.0
+    qc_metrics_calls = 0
+    total_batch_time_sec = 0.0
     if qc_enabled:
         qc_huber = nn.HuberLoss(delta=args.huber_delta, reduction="mean")
         qc_ssim = SSIMMSELoss3D(
@@ -885,6 +901,7 @@ def train_epoch(
     print(f"    Train iterator/sampler startup: {iter_elapsed_min:04.1f}m")
     reload_requested = False
     for batch_idx in range(target_batches):
+        batch_start_t0 = time.monotonic()
         try:
             input_data, target, mask = next(loader_iter)
             input_data = input_data.unsqueeze(1).float().to(device, non_blocking=True)
@@ -967,6 +984,7 @@ def train_epoch(
             raise
 
         if qc_enabled and (((batch_idx + 1) % qc_every) == 0 or (batch_idx + 1) == target_batches):
+            qc_start_t0 = time.monotonic()
             with torch.no_grad():
                 out_det = output.detach().float()
                 tgt_det = target.detach().float()
@@ -985,6 +1003,8 @@ def train_epoch(
                     f"          . output min/mean/max/std: {output.min().item():.3f}/{output.mean().item():.3f}/{output.max().item():.3f}/{output.std().item():.3f}\n"
                     f"          . target min/mean/max/std: {target.min().item():.3f}/{target.mean().item():.3f}/{target.max().item():.3f}/{target.std().item():.3f}\n"
                 )
+            qc_time_sec_total += time.monotonic() - qc_start_t0
+            qc_metrics_calls += 1
 
         temp_c = None
         if thermal_guard is not None:
@@ -1006,6 +1026,7 @@ def train_epoch(
 
         total_loss += batch_loss
         total_batches += 1
+        total_batch_time_sec += time.monotonic() - batch_start_t0
 
         with torch.no_grad():
             x_nz = (input_data != 0).sum().item()
@@ -1049,11 +1070,28 @@ def train_epoch(
         plt.close(fig)
 
     avg_loss = total_loss / max(total_batches, 1)
+    qc_overhead_ratio = _compute_qc_overhead_ratio(qc_time_sec_total, total_batch_time_sec)
+    qc_budget_exceeded = bool(
+        qc_enabled
+        and qc_metrics_calls > 0
+        and (not _is_qc_overhead_within_budget(qc_overhead_ratio, qc_budget_ratio))
+    )
+    if qc_budget_exceeded:
+        print(
+            "    WARNING: batch QC overhead ratio exceeded configured budget "
+            f"({qc_overhead_ratio:.3f} > {qc_budget_ratio:.3f})."
+        )
+
     if return_details:
         return {
             "loss": avg_loss,
             "batches_processed": total_batches,
             "reload_requested": reload_requested,
+            "qc_metrics_calls": qc_metrics_calls,
+            "qc_time_sec": qc_time_sec_total,
+            "total_batch_time_sec": total_batch_time_sec,
+            "qc_overhead_ratio": qc_overhead_ratio,
+            "qc_overhead_budget_exceeded": qc_budget_exceeded,
         }
     return avg_loss
 
@@ -1260,6 +1298,12 @@ def main():
         type=int,
         default=10,
         help="When QC metrics are enabled, print them every N batches (default: 10)",
+    )
+    parser.add_argument(
+        "--batch_qc_max_overhead_ratio",
+        type=float,
+        default=1.0,
+        help="Maximum allowed QC overhead ratio before warning when QC is enabled (default: 1.0)",
     )
     parser.add_argument("--ssim_window_size", type=int, default=16,
                        help="3D SSIM Gaussian window size (default: 16; only used when --loss_type=ssim_mse)")
@@ -1509,6 +1553,8 @@ def main():
         parser.error("--huber_delta must be > 0")
     if args.batch_qc_every <= 0:
         parser.error("--batch_qc_every must be > 0")
+    if args.batch_qc_max_overhead_ratio <= 0:
+        parser.error("--batch_qc_max_overhead_ratio must be > 0")
     if args.ssim_window_size < 3:
         parser.error("--ssim_window_size must be >= 3")
     if args.ssim_sigma <= 0:
