@@ -36,7 +36,10 @@ Central dispatcher behavior:
 
 - train.py::_compute_masked_loss defines valid_mask as inverse of incoming mask.
 - If criterion forward includes valid_mask, full-shape tensors are passed.
-- Otherwise, fallback path uses output[~mask], target[~mask] boolean indexing.
+- Otherwise, fallback path is now restricted to pointwise criteria only
+   (MSE/L1/Huber/SmoothL1) or explicit opt-in via allow_mask_indexing=True.
+- Unsupported criteria now fail fast with a clear ValueError instead of silent
+   flattened fallback.
 
 Loss modules with explicit valid_mask support:
 
@@ -57,9 +60,11 @@ Loss modules with explicit valid_mask support:
    - Splits regions into base and cluster masks by masking density.
    - Calls base criterion twice with derived masks.
 
-Observed risk:
+Boundary cleanup result:
 
-- The fallback boolean-indexing path can flatten structure and may be unsafe for structural criteria that do not expose valid_mask.
+- Fallback flattening remains available for safe pointwise criteria.
+- Structural or custom criteria without valid_mask support now fail early.
+- New routing tests cover valid_mask path, safe fallback path, and fail-fast path.
 
 ## C. Mask Usage In Gradient Backpropagation
 
@@ -78,9 +83,12 @@ Validation path:
 
 - validate runs under no_grad and uses _compute_masked_loss for evaluation only.
 
-Observed risk:
+Boundary cleanup result:
 
-- Per-batch QC block in train.py recomputes extra masked losses for logging, increasing compute overhead inside training loop.
+- Per-batch QC metrics are now disabled by default.
+- QC metrics run only when --enable_batch_qc_metrics is set.
+- QC cadence is controlled by --batch_qc_every.
+- QC metrics are computed under no-grad and criteria are instantiated once per epoch.
 
 ## D. Mask Usage Restricted To Printed Statistics, Diagnostics, QC
 
@@ -101,17 +109,17 @@ Alignment:
 1. The repository uses full-shape mask-aware loss signatures for major custom losses.
 2. Reduction and masking are handled inside loss modules, similar to mask-aware wrapper style.
 
-Divergence:
+Divergence (updated):
 
-1. Runtime signature inspection plus fallback indexing in _compute_masked_loss is less explicit than MONAI-style fixed loss contracts.
-2. QC metrics recomputation in train loop is more coupled than typical train-vs-metric separation patterns.
+1. Runtime signature inspection remains in use, but unsupported routing is now fail-fast and safer.
+2. QC recomputation is now opt-in and interval-gated, reducing coupling to the hot path.
 3. Semantic inversion at train boundary is implicit and should be formalized.
 
-Phase 1 recommendations:
+Phase 1 recommendations (remaining):
 
 1. Keep a single explicit mask contract section in docs and tests.
-2. Add fail-fast handling for unsupported criterion signatures.
-3. Preserve diagnostics but move expensive QC recomputation out of batch hot path where feasible.
+2. Keep fail-fast routing tests in the required gate.
+3. Monitor QC runtime overhead only when the opt-in flag is enabled.
 
 ## Immediate Phase 1 Deliverables Status
 
@@ -121,9 +129,28 @@ Phase 1 recommendations:
 - Diagnostics/QC-only mapping: complete.
 - MONAI API/pattern comparison notes: complete.
 
-## Next Phase 1 Actions
+## Phase 1 Implemented Changes
 
-1. Add tests/test_compute_masked_loss_routing.py for dispatcher behavior and fail-fast checks.
-2. Add tests/test_mask_semantics_contract.py for end-to-end mask meaning consistency.
-3. Run targeted non-training test gate.
-4. Commit docs and new tests as Phase 1 checkpoint.
+1. Added tests/test_compute_masked_loss_routing.py.
+2. Added tests/test_mask_semantics_contract.py.
+3. Hardened train.py::_compute_masked_loss with explicit fail-fast behavior for unsupported criteria.
+4. Decoupled per-batch QC diagnostics in train.py by adding:
+   - --enable_batch_qc_metrics (default off)
+   - --batch_qc_every (interval control)
+5. Added QC-enabled smoke coverage in tests/test_train_epoch_smoke.py.
+
+## Phase 1/2 Boundary Checklist
+
+- [x] Phase 1 mapping docs complete (md/html in plans).
+- [x] Mask routing and semantics tests added.
+- [x] Focused tests for routing/semantics/smoke passed.
+- [x] Fail-fast routing behavior implemented.
+- [x] Batch QC recomputation decoupled from default hot path.
+- [ ] Run full targeted non-training suite after latest train.py changes.
+- [ ] Commit boundary-cleanup documentation update.
+
+## Next Actions (Phase 2 Entry)
+
+1. Run full targeted non-training suite as final Phase 1 gate after boundary cleanup.
+2. Commit updated Phase 1 report.
+3. Begin Phase 2 gap-triage updates from MONAI comparison findings.

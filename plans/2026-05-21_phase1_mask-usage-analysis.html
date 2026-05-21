@@ -76,7 +76,8 @@
       <ul>
         <li><code>train.py::_compute_masked_loss</code> computes <code>valid_mask = ~mask</code>.</li>
         <li>If criterion supports <code>valid_mask</code>, full-shape tensors are passed.</li>
-        <li>Fallback path uses boolean indexing <code>output[~mask], target[~mask]</code>.</li>
+        <li>Fallback path is restricted to pointwise criteria or explicit opt-in via <code>allow_mask_indexing=True</code>.</li>
+        <li>Unsupported criteria now fail fast with a clear error instead of silent flattening.</li>
       </ul>
       <p>Mask-aware losses confirmed: <code>SSIMMSELoss3D</code>, <code>MONAIStyleSSIMMSELoss3D</code>, <code>SlidingWindowStatsLoss3D</code>, <code>CompositeClusterAwareLoss</code>.</p>
 
@@ -92,11 +93,11 @@
 
       <h2>D. Mask Usage Restricted To Diagnostics And QC</h2>
       <ol>
-        <li>QC block in train loop recomputes additional masked losses for reporting.</li>
+        <li>QC block is now opt-in and recomputes additional masked losses only when explicitly enabled.</li>
         <li>Per-batch stats and figures are emitted for diagnostics.</li>
         <li><code>plotting.py</code> consumes volumes and does not directly consume mask tensors.</li>
       </ol>
-      <div class="note">Boundary concern: diagnostics should remain outside the hot path when possible to reduce overhead.</div>
+      <div class="note">Boundary update: default training path is no longer coupled to per-batch QC recomputation unless <code>--enable_batch_qc_metrics</code> is set.</div>
 
       <h2>E. MONAI 1.0.0 Pattern Comparison</h2>
       <p>Alignment:</p>
@@ -106,17 +107,36 @@
       </ul>
       <p>Divergence:</p>
       <ul>
-        <li>Runtime signature inspection plus fallback indexing is less explicit than fixed contracts.</li>
-        <li>QC recomputation in-train is more coupled than typical train-vs-metric separation.</li>
+        <li>Runtime signature inspection remains, but unsupported routing is now fail-fast.</li>
+        <li>QC recomputation is now opt-in and interval-gated, reducing hot-path coupling.</li>
         <li>Mask inversion at train boundary should be formalized in one contract.</li>
       </ul>
 
-      <h2>Next Actions</h2>
+      <h2>Phase 1 Implemented Changes</h2>
       <ol>
-        <li>Add <code>tests/test_compute_masked_loss_routing.py</code>.</li>
-        <li>Add <code>tests/test_mask_semantics_contract.py</code>.</li>
-        <li>Run targeted non-training test gate.</li>
-        <li>Commit docs plus new tests as Phase 1 checkpoint.</li>
+        <li>Added <code>tests/test_compute_masked_loss_routing.py</code>.</li>
+        <li>Added <code>tests/test_mask_semantics_contract.py</code>.</li>
+        <li>Hardened <code>_compute_masked_loss</code> with fail-fast behavior for unsupported criteria.</li>
+        <li>Decoupled per-batch QC metrics via <code>--enable_batch_qc_metrics</code> and <code>--batch_qc_every</code>.</li>
+        <li>Added QC-enabled smoke coverage in <code>tests/test_train_epoch_smoke.py</code>.</li>
+      </ol>
+
+      <h2>Phase 1/2 Boundary Checklist</h2>
+      <ul>
+        <li>[x] Phase 1 mapping docs complete (md/html in plans).</li>
+        <li>[x] Mask routing and semantics tests added.</li>
+        <li>[x] Focused routing/semantics/smoke tests passed.</li>
+        <li>[x] Fail-fast routing behavior implemented.</li>
+        <li>[x] Batch QC recomputation decoupled from default hot path.</li>
+        <li>[ ] Run full targeted non-training suite after latest <code>train.py</code> changes.</li>
+        <li>[ ] Commit boundary-cleanup documentation update.</li>
+      </ul>
+
+      <h2>Next Actions (Phase 2 Entry)</h2>
+      <ol>
+        <li>Run full targeted non-training suite as final Phase 1 gate after boundary cleanup.</li>
+        <li>Commit updated Phase 1 report.</li>
+        <li>Begin Phase 2 gap triage from MONAI comparison findings.</li>
       </ol>
     </div>
   </div>
