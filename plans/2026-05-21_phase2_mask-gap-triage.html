@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phase 2 Mask Gap Triage</title>
+  <style>
+    :root {
+      --bg: #f5f8f7;
+      --card: #ffffff;
+      --text: #1f2a33;
+      --muted: #49606f;
+      --line: #d7e3ea;
+      --accent: #0f766e;
+      --soft: #e8f7f4;
+    }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 85% -5%, #dff4ed, var(--bg) 45%);
+      color: var(--text);
+      font-family: "IBM Plex Sans", "Segoe UI", Arial, sans-serif;
+      line-height: 1.55;
+    }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 16px 56px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 22px;
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
+    }
+    h1 { margin: 0 0 10px; font-size: 1.9rem; }
+    h2 { margin-top: 24px; border-left: 4px solid var(--accent); padding-left: 10px; font-size: 1.18rem; }
+    h3 { margin-top: 16px; font-size: 1.03rem; }
+    p, li { color: var(--text); }
+    .meta { color: var(--muted); font-size: 0.95rem; margin-bottom: 12px; }
+    .note {
+      margin-top: 12px;
+      background: var(--soft);
+      border: 1px solid #bde6de;
+      border-radius: 10px;
+      padding: 12px;
+    }
+    code {
+      font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
+      background: #f1f5f9;
+      padding: 0.08rem 0.28rem;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>Phase 2 Mask Gap Triage</h1>
+      <p class="meta">Date: 2026-05-21<br/>Branch: <code>feat/masking-loss-reevaluation</code><br/>Precondition: Phase 1 boundary gate complete (42 passed, commit 7260095).<br/>Operating constraint: Keep A2 training run undisturbed; prioritize non-training-safe changes first.</p>
+
+      <h2>Objective</h2>
+      <p>Convert Phase 1 findings into an ordered remediation backlog with explicit acceptance criteria, test gates, and safe rollout sequencing.</p>
+
+      <h2>Inputs From Phase 1</h2>
+      <ol>
+        <li>Mask semantics are correct but inversion at train boundary is still implicit.</li>
+        <li>Routing safety improved via fail-fast behavior and pointwise fallback constraints.</li>
+        <li>QC overhead is opt-in and interval-gated, but runtime budget should be measured under real settings.</li>
+        <li>MONAI comparison indicates value in explicit contracts over signature-driven dispatch.</li>
+      </ol>
+
+      <h2>Ranked Gap List</h2>
+
+      <h3>High Priority</h3>
+      <ol>
+        <li>Contract formalization at train boundary: semantic transition remains implicit and is refactor-sensitive.</li>
+        <li>Dispatcher contract clarity: signature inspection remains for mixed criteria and can misroute custom structural losses.</li>
+      </ol>
+
+      <h3>Medium Priority</h3>
+      <ol>
+        <li>QC observability and overhead accounting: no standard runtime budget check exists yet.</li>
+        <li>Error ergonomics for unsupported criteria: troubleshooting path is not yet documented in user workflow.</li>
+      </ol>
+
+      <h3>Low Priority</h3>
+      <ol>
+        <li>MONAI-style alignment polish: fixed loss contracts are not universal yet, mainly a maintainability concern.</li>
+      </ol>
+
+      <h2>Remediation Backlog With Acceptance Criteria</h2>
+      <ol>
+        <li>Add explicit mask contract section in training docs with source semantics, inversion point, and valid-mask rules.<br/>Acceptance: one canonical section referenced by train and loss docs with no conflicting statements.</li>
+        <li>Add contract assertion helper around <code>_compute_masked_loss</code> entry for dtype/shape/meaning expectations.<br/>Acceptance: tests cover pass and failure cases for malformed masks.</li>
+        <li>Add dispatcher compatibility matrix tests for supported criterion categories and routing paths.<br/>Acceptance: unsupported criteria fail fast without valid_mask and pass with safe pointwise fallback.</li>
+        <li>Add QC budget check in smoke/integration path when QC is enabled.<br/>Acceptance: deterministic harness with documented threshold.</li>
+        <li>Add troubleshooting note for fail-fast criteria errors with concrete fix paths.<br/>Acceptance: docs linked from README or training guide.</li>
+      </ol>
+
+      <h2>Implementation Order</h2>
+      <ol>
+        <li>Contract docs and assertions (high priority, low blast radius).</li>
+        <li>Dispatcher compatibility matrix expansion.</li>
+        <li>QC overhead budget instrumentation and tests.</li>
+        <li>Documentation and ergonomics polish.</li>
+      </ol>
+
+      <h2>Test Gate For Phase 2 Completion</h2>
+      <p>Required non-training suite:</p>
+      <ul>
+        <li><code>tests/test_losses.py</code></li>
+        <li><code>tests/test_masking_sampling.py</code></li>
+        <li><code>tests/test_loss_cluster_aware.py</code></li>
+        <li><code>tests/test_loss_cluster_aware_extra.py</code></li>
+        <li><code>tests/test_compute_masked_loss_routing.py</code></li>
+        <li><code>tests/test_mask_semantics_contract.py</code></li>
+        <li><code>tests/test_train_epoch_smoke.py</code></li>
+      </ul>
+      <p>Additional Phase 2 tests to add:</p>
+      <ol>
+        <li><code>tests/test_mask_contract_assertions.py</code></li>
+        <li><code>tests/test_masked_loss_dispatch_matrix.py</code></li>
+        <li><code>tests/test_qc_overhead_budget.py</code></li>
+      </ol>
+
+      <div class="note">Gate condition: all required and new Phase 2 tests pass, docs are updated in md/html, and no A2 training interruption is required.</div>
+
+      <h2>Deliverables</h2>
+      <ol>
+        <li>Code updates for contract assertions and dispatch matrix coverage.</li>
+        <li>QC budget instrumentation and test(s).</li>
+        <li>Updated docs with explicit troubleshooting and contract guidance.</li>
+        <li>Phase 2 completion report artifact.</li>
+      </ol>
+
+      <h2>Out Of Scope</h2>
+      <ol>
+        <li>Major architecture rewrite of the training loop.</li>
+        <li>Replacing all custom criteria with MONAI-native equivalents.</li>
+        <li>Any change requiring A2 run interruption.</li>
+      </ol>
+
+      <h2>Execution Notes</h2>
+      <ul>
+        <li>Favor small commits by backlog item.</li>
+        <li>Keep all changes reversible and test-gated.</li>
+        <li>Preserve default behavior: QC metrics remain disabled unless explicitly enabled.</li>
+      </ul>
+    </div>
+  </div>
+</body>
+</html>

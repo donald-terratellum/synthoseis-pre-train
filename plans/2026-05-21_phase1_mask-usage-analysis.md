@@ -146,11 +146,11 @@ Phase 1 recommendations (remaining):
 - [x] Focused tests for routing/semantics/smoke passed.
 - [x] Fail-fast routing behavior implemented.
 - [x] Batch QC recomputation decoupled from default hot path.
-- [ ] Run full targeted non-training suite after latest train.py changes.
-- [ ] Commit boundary-cleanup documentation update.
+- [x] Run full targeted non-training suite after latest train.py changes.
+- [x] Commit boundary-cleanup documentation update.
 
 ## Next Actions (Phase 2 Entry)
 
-1. Run full targeted non-training suite as final Phase 1 gate after boundary cleanup.
-2. Commit updated Phase 1 report.
-3. Begin Phase 2 gap-triage updates from MONAI comparison findings.
+1. Begin Phase 2 gap-triage updates from MONAI comparison findings.
+2. Implement high-priority contract hardening items first.
+3. Keep A2 training run undisturbed while landing non-training-safe fixes.
