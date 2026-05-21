@@ -32,6 +32,31 @@ Mode: Option 2 (keep A2 ablation running, perform non-training Phase 0 tasks now
 - checkpoints/ablation_2026_05_20/A1_lr5e5
 - checkpoints/ablation_2026_05_20/summary_A1_C2.csv
 
+## A1 Baseline Metrics (Operational Baseline)
+
+Source of truth:
+
+- checkpoints/ablation_2026_05_20/summary_A1_C2.csv
+- train_ablation_A1_to_C2.log
+
+Capture fields for run `A1_lr5e5`:
+
+| Field | Value | Notes |
+|---|---|---|
+| exit_code | 0 | Extracted from summary CSV row for A1_lr5e5 |
+| final_train_loss | 0.0010 | Extracted from summary CSV row for A1_lr5e5 |
+| final_val_loss | 0.0016 | Extracted from summary CSV row for A1_lr5e5 |
+| last_epoch_line | Epoch 20/20 \| LR: 1.000e-06 \| 2026-5-21 01:48:45 | Extracted from summary CSV row for A1_lr5e5 |
+| log_file | checkpoints/ablation_2026_05_20/A1_lr5e5/train.log | Expected output path |
+
+Extraction command (when convenient):
+
+`awk -F, 'NR==1 || /A1_lr5e5/' checkpoints/ablation_2026_05_20/summary_A1_C2.csv`
+
+## Baseline Caveat (Required)
+
+This baseline is operational, not fully frozen: dataset membership can drift across epochs due to prune/split assignment events observed in the ablation flow. Use A1 as the reference for current behavior, but treat strict before/after attribution as provisional until a short frozen-data reproducibility check is run after A2 is stopped.
+
 ## Phase 0 Checklist (Parallel Track)
 
 Status legend: [x] done, [ ] pending
@@ -39,10 +64,11 @@ Status legend: [x] done, [ ] pending
 - [x] Create implementation branch from local main.
 - [x] Record decision to reuse A1 as baseline evidence (operational baseline).
 - [x] Record constraint and deferred training tasks while A2 is active.
-- [ ] Capture exact A1 final metrics from summary CSV in this file.
-- [ ] Add explicit baseline caveat: dataset membership drift due to prune/split events.
+- [x] Capture exact A1 final metrics from summary CSV in this file.
+- [x] Add explicit baseline caveat: dataset membership drift due to prune/split events.
 - [x] Draft critic review notes focused on mask semantics and loss-routing safety.
 - [x] Define targeted test additions for mask semantics and gradient behavior.
+- [x] Validate targeted non-training tests pass on current branch.
 - [ ] Commit Phase 0 critic notes and test-plan artifacts.
 
 ## Constructive Critic Review Prompts

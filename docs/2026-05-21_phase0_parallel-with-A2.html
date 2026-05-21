@@ -74,14 +74,40 @@
         <li>Any training-side metric comparison requiring a fresh run.</li>
       </ul>
 
+      <h2>A1 Baseline Metrics (Operational Baseline)</h2>
+      <p>Source of truth:</p>
+      <ul>
+        <li><code>checkpoints/ablation_2026_05_20/summary_A1_C2.csv</code></li>
+        <li><code>train_ablation_A1_to_C2.log</code></li>
+      </ul>
+      <p>Capture fields for run <code>A1_lr5e5</code>:</p>
+      <ul>
+        <li>exit_code: 0</li>
+        <li>final_train_loss: 0.0010</li>
+        <li>final_val_loss: 0.0016</li>
+        <li>last_epoch_line: Epoch 20/20 | LR: 1.000e-06 | 2026-5-21 01:48:45</li>
+        <li>log_file: <code>checkpoints/ablation_2026_05_20/A1_lr5e5/train.log</code></li>
+      </ul>
+      <p>Extraction command:</p>
+      <p><code>awk -F, 'NR==1 || /A1_lr5e5/' checkpoints/ablation_2026_05_20/summary_A1_C2.csv</code></p>
+
+      <h2>Baseline Caveat (Required)</h2>
+      <p>
+        This baseline is operational, not fully frozen: dataset membership can drift across epochs due to
+        prune/split assignment events observed in the ablation flow. Use A1 as the reference for current behavior,
+        but treat strict before/after attribution as provisional until a short frozen-data reproducibility check is
+        run after A2 is stopped.
+      </p>
+
       <h2>Checklist</h2>
       <ul>
         <li>[x] Branch created from local main.</li>
         <li>[x] Decision to reuse A1 as baseline evidence documented.</li>
         <li>[x] Deferred training tasks documented while A2 is active.</li>
-        <li>[ ] Capture exact A1 final metrics from summary CSV.</li>
-        <li>[ ] Add caveat for dataset prune/split drift.</li>
+        <li>[x] Capture exact A1 final metrics from summary CSV.</li>
+        <li>[x] Add caveat for dataset prune/split drift.</li>
         <li>[x] Draft critic review notes and targeted tests.</li>
+        <li>[x] Validate targeted non-training tests pass on current branch.</li>
         <li>[ ] Commit Phase 0 critic notes and test-plan artifacts.</li>
       </ul>
 
