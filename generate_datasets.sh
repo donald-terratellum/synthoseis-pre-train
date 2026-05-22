@@ -20,6 +20,8 @@
 #                                 starting a synthoseis run (default: 50)
 #   --disk-recheck-sec N          Seconds to sleep before rechecking disk space
 #                                 when below threshold (default: 3600)
+#   --max-num-datasets N          Max valid datasets allowed in append-only mode;
+#                                 pause 30 minutes when at/above cap (default: 14)
 #   --start-index N               First run index (d4, default: 1; auto-detected from
 #                                 existing _synthoseis_run_NNNN dirs if not set)
 #   --no-replace                  Append-only mode (default): never delete datasets
@@ -46,6 +48,8 @@ NO_REPLACE=true
 TARGET_NEW_PER_EPOCH=2
 MIN_FREE_GB=50
 RECHECK_SLEEP_SEC=3600
+MAX_NUM_DATASETS=14
+DATASET_CAP_SLEEP_SEC=180
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -57,6 +61,7 @@ while [[ $# -gt 0 ]]; do
         --check-log)            CHECK_LOG="$2";              shift 2 ;;
         --min-free-gb)          MIN_FREE_GB="$2";            shift 2 ;;
         --disk-recheck-sec)     RECHECK_SLEEP_SEC="$2";      shift 2 ;;
+        --max-num-datasets)     MAX_NUM_DATASETS="$2";       shift 2 ;;
         --start-index)          START_INDEX="$2";            shift 2 ;;
         --no-replace)           NO_REPLACE=true;              shift ;;
         --replace-oldest)       NO_REPLACE=false;             shift ;;
@@ -76,6 +81,13 @@ list_datasets_oldest_first() {
     ls -1dtr "$ZARR_FOLDER"/seismic__*/ 2>/dev/null \
         | while IFS= read -r d; do basename "${d%/}"; done
 }
+
+    # Count valid seismic datasets: directories matching seismic__* that contain
+    # model_data.zarr.
+    count_valid_datasets() {
+        find "$ZARR_FOLDER" -maxdepth 1 -type d -name 'seismic__*' \
+        -exec test -d '{}/model_data.zarr' ';' -print 2>/dev/null | wc -l | tr -d ' '
+    }
 
 # Determine the run index to start from (auto-detect from existing run dirs).
 detect_start_index() {
@@ -182,6 +194,11 @@ if [[ ! "$RECHECK_SLEEP_SEC" =~ ^[0-9]+$ ]] || (( RECHECK_SLEEP_SEC <= 0 )); the
     exit 1
 fi
 
+if [[ ! "$MAX_NUM_DATASETS" =~ ^[0-9]+$ ]] || (( MAX_NUM_DATASETS <= 0 )); then
+    echo "ERROR: --max-num-datasets must be a positive integer (got: '$MAX_NUM_DATASETS')." >&2
+    exit 1
+fi
+
 if [[ ! -f "$SYNTHOSEIS_DIR/main.py" ]]; then
     echo "ERROR: '$SYNTHOSEIS_DIR/main.py' not found." >&2
     echo "       Set --synthoseis-dir to the directory containing synthoseis main.py" >&2
@@ -217,6 +234,7 @@ echo "  Config         : $CONFIG"
 echo "  Zarr folder    : $ZARR_FOLDER"
 echo "  Min free space : ${MIN_FREE_GB} GB"
 echo "  Recheck sleep  : $(fmt_duration "$RECHECK_SLEEP_SEC") (${RECHECK_SLEEP_SEC}s)"
+echo "  Max datasets   : ${MAX_NUM_DATASETS} (append-only cap; sleep $(fmt_duration "$DATASET_CAP_SLEEP_SEC") at/above cap)"
 [[ -n "$CHECK_LOG" ]] && echo "  Training log   : $CHECK_LOG"
 if [[ "$NO_REPLACE" == "true" ]]; then
     echo "  Mode           : append-only (default)"
@@ -233,6 +251,22 @@ for (( i=0; i<NUM_RUNS; i++ )); do
     echo "──────────────────────────────────────────"
     echo "Run $((i+1))/$NUM_RUNS  →  tag: $run_tag"
     echo "──────────────────────────────────────────"
+
+    # In append-only mode, pause generation when valid dataset count reaches cap.
+    if [[ "$NO_REPLACE" == "true" ]]; then
+        while true; do
+            valid_count=$(count_valid_datasets)
+            if [[ ! "$valid_count" =~ ^[0-9]+$ ]]; then
+                valid_count=0
+            fi
+            if (( valid_count < MAX_NUM_DATASETS )); then
+                break
+            fi
+            echo "Dataset cap reached: ${valid_count} valid datasets (cap=${MAX_NUM_DATASETS})."
+            echo "  Sleeping $(fmt_duration "$DATASET_CAP_SLEEP_SEC") before rechecking dataset count."
+            sleep "$DATASET_CAP_SLEEP_SEC"
+        done
+    fi
 
     # Safeguard: synthoseis can require substantial temporary staging space
     # before it deletes non-essential zarr volumes.
