@@ -8,6 +8,7 @@ import random
 import time
 import math
 import platform
+import sys
 from datetime import datetime, timedelta
 import torch
 import torch.nn as nn
@@ -16,6 +17,7 @@ import argparse
 import numpy as np
 import shutil
 from pathlib import Path
+from typing import Any, cast
 
 import matplotlib
 matplotlib.use("Agg")
@@ -51,7 +53,7 @@ if platform.system() == "Darwin":
 
 def _save_checkpoint(path: Path, model, optimizer, scaler, epoch: int,
                      train_loss: float, val_loss: float,
-                     train_paths: list = None, val_paths: list = None,
+                     train_paths: list[str] | None = None, val_paths: list[str] | None = None,
                      ds_idx: int = -1,
                      ema_state: dict | None = None) -> None:
     """Save a resumable checkpoint.  ds_idx=-1 means end-of-epoch."""
@@ -298,6 +300,83 @@ def _print_thermal_monitor_status(max_c: float, pressure_trip_level: str) -> Non
             print(f"  Pause trigger uses pressure levels >= {pressure_msg} when CPU temperature is unavailable.")
 
 
+def _collect_cli_option_names(argv: list[str]) -> set[str]:
+    """Return normalized option names explicitly present in argv.
+
+    Converts dashes to underscores so option names match argparse dest fields.
+    """
+    provided: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("--"):
+            continue
+        name = token[2:].split("=", 1)[0].strip()
+        if name:
+            provided.add(name.replace("-", "_"))
+    return provided
+
+
+def _print_loss_and_backprop_summary(
+    args,
+    cli_provided: set[str],
+    defaults: dict[str, object],
+    scaler,
+) -> None:
+    """Print grouped summary of effective optimization and backprop settings."""
+    def _src(name: str) -> str:
+        return "user" if name in cli_provided else "default"
+
+    amp_enabled = scaler is not None
+    grad_accum = max(1, int(args.grad_accum_steps))
+    clip_desc = f"{args.grad_clip_norm:g}" if args.grad_clip_norm > 0 else "disabled"
+    ema_enabled = args.ema_decay > 0
+    ema_desc = f"{args.ema_decay:g}" if ema_enabled else "disabled"
+
+    label_width = 18
+
+    def _kv(label: str, value: str) -> None:
+        print(f"    {label:<{label_width}} : {value}")
+
+    print("Training configuration:")
+    print("  Optimization:")
+    _kv("optimizer", "Adam (fixed)")
+    _kv("lr", f"{args.lr:.3e} ({_src('lr')}, default={defaults['lr']:.3e})")
+    _kv(
+        "lr schedule",
+        f"{args.lr_schedule} ({_src('lr_schedule')}, default={defaults['lr_schedule']})",
+    )
+    if args.lr_schedule != "constant":
+        _kv(
+            "schedule details",
+            f"min={args.lr_min:.3e}, warmup={args.lr_warmup_epochs} epoch(s), "
+            f"warmup_start_factor={args.lr_warmup_start_factor:g}",
+        )
+        if args.lr_schedule == "poly":
+            _kv("poly power", f"{args.lr_poly_power:g}")
+
+    print("  Loss and backprop:")
+    _kv("loss", "MSE over unmasked voxels (fixed)")
+    _kv("AMP", f"{'on' if amp_enabled else 'off'} (auto)")
+    _kv(
+        "grad_accum_steps",
+        f"{grad_accum} ({_src('grad_accum_steps')}, default={defaults['grad_accum_steps']})",
+    )
+    _kv(
+        "grad_clip_norm",
+        f"{clip_desc} ({_src('grad_clip_norm')}, default={defaults['grad_clip_norm']})",
+    )
+
+    print("  EMA:")
+    _kv("enabled", "yes" if ema_enabled else "no")
+    _kv("decay", f"{ema_desc} ({_src('ema_decay')}, default={defaults['ema_decay']})")
+    _kv(
+        "update every",
+        f"{max(1, int(args.ema_update_every))} step(s) "
+        f"({_src('ema_update_every')}, default={defaults['ema_update_every']})",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dynamic dataset helpers
 # ---------------------------------------------------------------------------
@@ -478,12 +557,19 @@ def _build_loaders(
 
     # --- train: build per-dataset loaders then merge ---
     train_per_ds: list[tuple[str, DataLoader]] = []
+
+    def _dataset_len(loader: DataLoader) -> int:
+        try:
+            return len(cast(Any, loader.dataset))
+        except Exception:
+            return 0
+
     print("  Loading train datasets...")
     for path in sorted(train_paths, key=_mtime):
         name = Path(path).parent.name
         try:
-            loader = create_dataloader(path, augment=True, **loader_kwargs)
-            print(f"    {name}: {len(loader.dataset)} samples, {len(loader)} batches")
+            loader = cast(DataLoader, create_dataloader(path, augment=True, **loader_kwargs))
+            print(f"    {name}: {_dataset_len(loader)} samples, {len(loader)} batches")
             train_per_ds.append((name, loader))
         except Exception as e:
             print(f"    WARNING: skipping {name} (train) — {e}")
@@ -508,8 +594,8 @@ def _build_loaders(
         for path in sorted(val_paths, key=_mtime):
             name = Path(path).parent.name
             try:
-                loader = create_dataloader(path, augment=False, **loader_kwargs)
-                print(f"    {name}: {len(loader.dataset)} samples, {len(loader)} batches")
+                loader = cast(DataLoader, create_dataloader(path, augment=False, **loader_kwargs))
+                print(f"    {name}: {_dataset_len(loader)} samples, {len(loader)} batches")
                 val_loaders.append((name, loader))
             except Exception as e:
                 print(f"    WARNING: skipping {name} (val) — {e}")
@@ -575,9 +661,10 @@ def _log_per_dataset_figures(
     try:
         with torch.no_grad():
             import warnings
-            all_datasets = list(merged_loader.dataset.datasets)
+            all_datasets = cast(list[Any], list(merged_loader.dataset.datasets))
             for ds in all_datasets:
-                ds_name = Path(ds.data_path).parent.name
+                ds_data_path = getattr(ds, "data_path", "unknown_dataset/model_data.zarr")
+                ds_name = Path(ds_data_path).parent.name
                 sample = _get_live_example(ds, all_datasets)
                 if sample is None:
                     warnings.warn(
@@ -590,7 +677,8 @@ def _log_per_dataset_figures(
                 inp_t = torch.from_numpy(inp).unsqueeze(0).unsqueeze(0).float().to(device)
                 out_t = model(inp_t)
                 tgt_t = torch.from_numpy(tgt).unsqueeze(0)
-                sample_ds_name = Path(sample_ds.data_path).parent.name
+                sample_ds_data_path = getattr(sample_ds, "data_path", "unknown_dataset/model_data.zarr")
+                sample_ds_name = Path(sample_ds_data_path).parent.name
                 title = (
                     f"{ds_name}  |  epoch {epoch + 1}  |  loss {epoch_loss:.4f}"
                 )
@@ -612,19 +700,19 @@ def train_epoch(
     criterion: nn.Module,
     device: torch.device,
     scaler=None,
-    writer: SummaryWriter = None,
+    writer: SummaryWriter | None = None,
     epoch: int = 0,
-    output_dir: Path = None,
-    train_paths: list = None,
-    val_paths: list = None,
-    thermal_guard: ThermalGuard = None,
+    output_dir: Path | None = None,
+    train_paths: list[str] | None = None,
+    val_paths: list[str] | None = None,
+    thermal_guard: ThermalGuard | None = None,
     grad_accum_steps: int = 1,
     grad_clip_norm: float = 0.0,
-    ema: ModelEMA = None,
+    ema: ModelEMA | None = None,
     ema_update_every: int = 1,
     max_batches: int | None = None,
     return_details: bool = False,
-) -> float | dict:
+) -> float | dict[str, float | int | bool]:
     """
     Train for one epoch using a single merged train DataLoader.
 
@@ -732,8 +820,8 @@ def train_epoch(
                 model=model,
                 optimizer=optimizer,
                 scaler=scaler,
-                train_paths=train_paths,
-                val_paths=val_paths,
+                train_paths=train_paths or [],
+                val_paths=val_paths or [],
                 temp_c=temp_c,
                 ema_state=ema.state_dict() if ema is not None else None,
             )
@@ -797,9 +885,9 @@ def validate(
     val_loaders: list,
     criterion: nn.Module,
     device: torch.device,
-    writer: SummaryWriter = None,
+    writer: SummaryWriter | None = None,
     epoch: int = 0,
-    thermal_guard: ThermalGuard = None,
+    thermal_guard: ThermalGuard | None = None,
     max_batches: int | None = None,
 ) -> float:
     """
@@ -1009,6 +1097,15 @@ def main():
                        help="Pause on thermal pressure at or above this level (default: serious). Use 'off' to disable pressure-based pausing")
 
     args = parser.parse_args()
+    cli_provided = _collect_cli_option_names(sys.argv[1:])
+    backprop_defaults = {
+        "lr": parser.get_default("lr"),
+        "lr_schedule": parser.get_default("lr_schedule"),
+        "grad_accum_steps": parser.get_default("grad_accum_steps"),
+        "grad_clip_norm": parser.get_default("grad_clip_norm"),
+        "ema_decay": parser.get_default("ema_decay"),
+        "ema_update_every": parser.get_default("ema_update_every"),
+    }
 
     if not (0.0 < args.val_split_ratio < 1.0):
         parser.error("--val_split_ratio must be between 0 and 1 (exclusive)")
@@ -1036,6 +1133,7 @@ def main():
     # --- Dataset split (done once; restored from checkpoint on resume) ---
     # Build initial path list: explicit --data_paths + discover from --data_folder
     all_paths = list(dict.fromkeys(args.data_paths))  # deduplicate preserving order
+    discovered_at_start: list[str] = []
     if args.data_folder:
         discovered_at_start = _discover_zarr_paths(args.data_folder, args.dataset_glob)
         known = set(all_paths)
@@ -1166,6 +1264,8 @@ def main():
 
     mem_info   = get_memory_info(device)
     total_mem  = mem_info["total_bytes"]
+    if total_mem is None:
+        raise RuntimeError("Unable to determine total device memory (mem_info['total_bytes'] is None)")
 
     # MPS can exceed reported RAM via unified memory.  The actual ceiling
     # (PYTORCH_MPS_HIGH_WATERMARK_RATIO default) is ~1.17 × reported RAM.
@@ -1233,6 +1333,7 @@ def main():
     criterion = nn.MSELoss()
     scaler = create_grad_scaler(device)
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    _print_loss_and_backprop_summary(args, cli_provided, backprop_defaults, scaler)
     thermal_guard = ThermalGuard(
         max_c=args.thermal_max_c,
         cooldown_sec=args.thermal_cooldown_sec,
@@ -1266,36 +1367,23 @@ def main():
         print(f"  Continuing from epoch {start_epoch + 1}")
 
     scheduler = _build_lr_scheduler(optimizer, args)
+    # Do not step scheduler here; stepping before any optimizer.step() triggers
+    # a PyTorch warning and can skip the first scheduled LR value.
     if scheduler is not None and start_epoch > 0:
-        for _ in range(start_epoch):
-            scheduler.step()
-    if scheduler is None:
-        print(f"LR schedule: constant (lr={optimizer.param_groups[0]['lr']:.3e})")
-    else:
-        print(
-            f"LR schedule: {args.lr_schedule} "
-            f"(start={args.lr:.3e}, min={args.lr_min:.3e}, warmup={args.lr_warmup_epochs} epochs)"
-        )
-    print(f"Grad accumulation: {max(1, args.grad_accum_steps)} step(s)")
+        scheduler.last_epoch = start_epoch - 1
+
+    print("  Epoch sizing:")
     if args.train_batches_per_epoch is not None:
         print(
-            f"Train epoch length: fixed {args.train_batches_per_epoch} batches "
+            f"    train: fixed {args.train_batches_per_epoch} batches "
             "(dataset list is fixed within each epoch; refreshed at epoch start)"
         )
     else:
-        print("Train epoch length: all batches from merged train loader")
+        print("    train: all batches from merged train loader")
     if args.val_batches_per_epoch is not None:
-        print(f"Validation epoch length: fixed {args.val_batches_per_epoch} batches")
+        print(f"    val: fixed {args.val_batches_per_epoch} batches")
     else:
-        print("Validation epoch length: all batches from val loaders")
-    if args.grad_clip_norm > 0:
-        print(f"Grad clipping: enabled (max norm {args.grad_clip_norm:.2f})")
-    else:
-        print("Grad clipping: disabled")
-    if ema is not None:
-        print(f"EMA: enabled (decay={args.ema_decay}, update every {max(1, args.ema_update_every)} step(s))")
-    else:
-        print("EMA: disabled")
+        print("    val: all batches from val loaders")
 
     print("\nStarting training...")
     training_start = time.monotonic()
@@ -1345,7 +1433,7 @@ def main():
                 print("  WARNING: No usable training datasets this epoch; skipping.")
                 continue
 
-            train_loss = train_epoch(
+            train_loss = cast(float, train_epoch(
                 model, train_loader, optimizer, criterion, device,
                 scaler=scaler, writer=writer, epoch=epoch, output_dir=output_dir,
                 train_paths=train_paths, val_paths=val_paths,
@@ -1354,7 +1442,7 @@ def main():
                 grad_clip_norm=args.grad_clip_norm,
                 ema=ema,
                 ema_update_every=args.ema_update_every,
-            )
+            ))
         else:
             target_batches = max(1, int(args.train_batches_per_epoch))
             batches_done = 0
@@ -1392,6 +1480,8 @@ def main():
                     max_batches=remaining,
                     return_details=True,
                 )
+                if not isinstance(details, dict):
+                    raise RuntimeError("train_epoch(return_details=True) returned non-dict details")
                 chunk_batches = int(details["batches_processed"])
                 if chunk_batches <= 0:
                     print("  WARNING: train epoch chunk processed 0 batches; stopping epoch early.")
@@ -1405,9 +1495,9 @@ def main():
 
                 pending_chunk_reload = True
 
-            train_loss = weighted_loss_sum / max(1, batches_done)
+            train_loss = float(weighted_loss_sum / max(1, batches_done))
 
-        if writer is not None:
+        if writer is not None and train_loader is not None:
             _log_per_dataset_figures(
                 model, train_loader, device, writer, epoch, train_loss
             )
