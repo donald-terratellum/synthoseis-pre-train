@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Session Summary: Geologic Score Study and Dataloader Integration (2026-05-22)</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #121a2b;
+      --panel-2: #0f1727;
+      --text: #e6edf7;
+      --muted: #a9b6cc;
+      --accent: #7cc7ff;
+      --border: #2a3b5c;
+    }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: linear-gradient(180deg, #0a1020, #0f1628 60%, #121a2b);
+      line-height: 1.5;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 28px 20px 40px;
+    }
+    header, section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px 20px;
+      margin-bottom: 14px;
+    }
+    h1, h2 {
+      margin: 0 0 10px;
+    }
+    h1 { font-size: 1.5rem; }
+    h2 { font-size: 1.05rem; color: var(--accent); }
+    p, li { color: var(--text); }
+    .muted { color: var(--muted); }
+    ul, ol { margin: 8px 0 0; padding-left: 22px; }
+    code {
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 1px 6px;
+      color: #d4ecff;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Session Summary: Geologic Score Study and Dataloader Integration (2026-05-22)</h1>
+      <p class="muted">Agentic coding session close-out for study tooling and production dataloader integration.</p>
+    </header>
+
+    <section>
+      <h2>Context and Goals</h2>
+      <ul>
+        <li>Design and implement geologic-score-driven center selection for seismic training crops.</li>
+        <li>Persist expensive score-derived center lists across epochs and stop/resume cycles.</li>
+        <li>Apply behavior to both training and validation with distinct policies.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>What Was Done</h2>
+      <ul>
+        <li>Created and refined plan artifacts in <code>studies/</code> (markdown and html).</li>
+        <li>Implemented study script with ranked point selection, JSON persistence, 3D HTML visualization, and rank-sampling histogram PNG output.</li>
+        <li>Integrated centered extraction and geologic-score sampling into dataloader + augmentation path.</li>
+        <li>Added train.py CLI controls for geologic-score sampling behavior.</li>
+        <li>Set study defaults to <code>--target-count 1000</code> and <code>--candidate-counts 5000</code>.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>How Was It Done</h2>
+      <ul>
+        <li>Study-first approach with iterative requirement refinement and critical review.</li>
+        <li>Schema validation against real zarr datasets before coding assumptions.</li>
+        <li>Incremental implementation and smoke testing, followed by full-suite verification.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>When Was It Done and By Whom</h2>
+      <ul>
+        <li>Date: 2026-05-22</li>
+        <li>Human operator: Donald Griffith</li>
+        <li>Agent: GitHub Copilot (GPT-5.3-Codex)</li>
+        <li>Primary commits by Donald Griffith: <code>50ed273</code>, <code>15be197</code></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Basic Info</h2>
+      <p><strong>Relevant commits</strong></p>
+      <ul>
+        <li><code>50ed273</code> Add geologic-score study tooling and planning artifacts</li>
+        <li><code>15be197</code> Integrate geologic-score center selection into training dataloaders</li>
+      </ul>
+      <p><strong>Files involved</strong></p>
+      <ul>
+        <li><code>pyproject.toml</code></li>
+        <li><code>train.py</code></li>
+        <li><code>src/synthoseis_pre_train/augmentation.py</code></li>
+        <li><code>src/synthoseis_pre_train/dataloader.py</code></li>
+        <li><code>studies/.gitignore</code></li>
+        <li><code>studies/geological_score_selection_plan.md</code></li>
+        <li><code>studies/geological_score_selection_plan.html</code></li>
+        <li><code>studies/geological_score_selection_study.py</code></li>
+      </ul>
+      <p><strong>Validation</strong></p>
+      <ul>
+        <li>Mac mini <code>uv run python -m pytest</code>: 29 passed, 0 failed.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Next and Future Follow-Up Work Suggestions</h2>
+      <ol>
+        <li>Add dedicated tests for persisted-point reuse, min-score enforcement, and fixed validation center invariance.</li>
+        <li>Add training telemetry for selected rank distributions per epoch.</li>
+        <li>Define optional refresh policy when score volumes are regenerated.</li>
+        <li>Add deterministic seed controls for rank-sampling ablation studies.</li>
+      </ol>
+    </section>
+  </div>
+</body>
+</html>
