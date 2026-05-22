@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Session Close-out: Test Validation and Summary (2026-05-22)</title>
+  <style>
+    :root {
+      --bg: #f7f8fa;
+      --card: #ffffff;
+      --ink: #1e2430;
+      --muted: #556070;
+      --accent: #0f62fe;
+      --border: #d9dee7;
+      --ok: #1f8a43;
+      --warn: #a76a00;
+    }
+    body {
+      margin: 0;
+      background: linear-gradient(180deg, #f4f7fb 0%, #eef2f8 100%);
+      color: var(--ink);
+      font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+      line-height: 1.55;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 32px auto;
+      padding: 0 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 8px 22px rgba(20, 28, 45, 0.07);
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 1.65rem;
+      line-height: 1.3;
+    }
+    h2 {
+      margin-top: 1.8rem;
+      font-size: 1.15rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px;
+    }
+    p, li {
+      color: var(--ink);
+    }
+    .muted {
+      color: var(--muted);
+    }
+    code {
+      background: #f1f4f8;
+      border: 1px solid #e1e7ef;
+      border-radius: 4px;
+      padding: 1px 5px;
+      font-family: Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    .ok {
+      color: var(--ok);
+      font-weight: 600;
+    }
+    .warn {
+      color: var(--warn);
+      font-weight: 600;
+    }
+    ul {
+      margin-top: 0.45rem;
+    }
+    .footer {
+      margin-top: 1.75rem;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <article class="card">
+      <h1>Session Close-out: Test Validation and Summary (2026-05-22)</h1>
+
+      <h2>1) Context and goals</h2>
+      <p><strong>Context</strong></p>
+      <ul>
+        <li>Repository: synthoseis-pre-train</li>
+        <li>Branch: test/basic-unet-w-mse</li>
+        <li>Remote: origin configured (<code>git@github.com:donald-terratellum/synthoseis-pre-train.git</code>)</li>
+        <li>Modified files at close-out start: <code>generate_datasets.sh</code>, <code>train.py</code>, <code>train_multi_datasets.sh</code></li>
+      </ul>
+      <p><strong>Goals</strong></p>
+      <ul>
+        <li>Create a dedicated folder for agentic coding session summaries.</li>
+        <li>Produce Markdown and HTML session summary artifacts.</li>
+        <li>Capture close-out status, testing evidence, and next actions.</li>
+      </ul>
+
+      <h2>2) What was done</h2>
+      <ul>
+        <li>Created folder: <code>docs/sessions</code>.</li>
+        <li>Collected repository metadata: status, branch/remotes, commits, and timestamps.</li>
+        <li>Recorded external test execution results from Mac mini.</li>
+        <li>Generated two summary documents (Markdown + HTML) with shared structure.</li>
+        <li>Committed code/script updates in <code>generate_datasets.sh</code>, <code>train.py</code>, and <code>train_multi_datasets.sh</code>.</li>
+      </ul>
+
+      <p><strong>Detailed code changes captured</strong></p>
+      <ul>
+        <li><code>generate_datasets.sh</code>: added disk-space and dataset-count guardrails (<code>--min-free-gb</code>, <code>--disk-recheck-sec</code>, <code>--max-num-datasets</code>), switched pacing to a target of 2 generated datasets per training epoch, and improved config-path resolution.</li>
+        <li><code>train.py</code>: added startup summary for optimization/loss/backprop values (with user/default source), improved typing/runtime guards, and fixed scheduler resume behavior to avoid pre-step warnings.</li>
+        <li><code>train_multi_datasets.sh</code>: added explicit optimizer/base-LR logging and a compact one-line loss/backprop configuration summary.</li>
+      </ul>
+
+      <h2>3) How was it done</h2>
+      <ul>
+        <li>Queried git state to build an accurate close-out snapshot.</li>
+        <li>Used a descriptive date-based basename: <code>session-closeout-test-validation-and-summary-2026-05-22</code>.</li>
+        <li>Documented close-out workflow with checklist items for review, commit, and push.</li>
+      </ul>
+
+      <h2>4) When was it done and by whom</h2>
+      <ul>
+        <li>Date: 2026-05-22</li>
+        <li>Close-out timestamp (local): 2026-05-22 15:35:11 CDT</li>
+        <li>Session operator: GitHub Copilot (GPT-5.3-Codex) via SSH</li>
+        <li>Repository author identity (latest commit metadata): Donald Griffith &lt;donald.terratellum@gmail.com&gt;</li>
+      </ul>
+
+      <h2>5) Basic info</h2>
+      <p><strong>Relevant commits</strong></p>
+      <ul>
+        <li><code>5f2c696</code> train+data: improve pacing, safety checks, and config visibility</li>
+        <li><code>c3d5a30</code> (HEAD -&gt; test/basic-unet-w-mse, origin/test/basic-unet-w-mse) copy from different branch</li>
+        <li><code>3220ca6</code> initial commit</li>
+        <li><code>94b383b</code> Initial commit</li>
+      </ul>
+
+      <p><strong>Files involved</strong></p>
+      <ul>
+        <li><code>generate_datasets.sh</code> (modified during session; committed)</li>
+        <li><code>train.py</code> (modified during session; committed)</li>
+        <li><code>train_multi_datasets.sh</code> (modified during session; committed)</li>
+        <li><code>docs/sessions/session-closeout-test-validation-and-summary-2026-05-22.md</code> (new)</li>
+        <li><code>docs/sessions/session-closeout-test-validation-and-summary-2026-05-22.html</code> (new)</li>
+      </ul>
+
+      <p><strong>Test evidence</strong></p>
+      <ul>
+        <li>Command: <code>/Users/donaldpg/synthoseis-pre-train/.venv/bin/python -m pytest -q</code></li>
+        <li class="ok">Result: 29 passed, 3 warnings in 7.25s</li>
+        <li class="warn">Warnings: MPS pin_memory warning; expected invalid-path warning in merged dataloader negative test.</li>
+      </ul>
+
+      <h2>6) Session close-out status</h2>
+      <ul>
+        <li>Review/status capture: complete</li>
+        <li>Test execution: complete and passing (reported from host machine)</li>
+        <li>Summary artifact generation: complete (revision pending commit)</li>
+        <li>Final review before commit: complete</li>
+        <li>Code commit creation: complete</li>
+        <li>Summary revision commit: pending</li>
+        <li>Push to origin after explicit approval: pending</li>
+      </ul>
+
+      <h2>7) Next and/or future follow-up work suggestions</h2>
+      <ol>
+        <li>Commit the updated session summaries so they reflect the new code commit.</li>
+        <li>Push to origin after explicit user approval.</li>
+        <li>Optionally run one additional smoke training run to verify pacing/logging behavior in live conditions.</li>
+        <li>Add a <code>docs/sessions</code> index page to make session history easy to browse.</li>
+        <li>Optionally automate close-out steps with a small script.</li>
+      </ol>
+
+      <p class="footer">Generated for session archival and close-out tracking.</p>
+    </article>
+  </main>
+</body>
+</html>
