@@ -295,6 +295,7 @@ def random_augmentation_3d(
 def augment_pair_3d(
     cube: np.ndarray,
     target_shape: Tuple[int, int, int] = (128, 128, 128),
+    center_xyz: Optional[Tuple[int, int, int]] = None,
     z_artifact_margin: int = 0,
     z_stretch_range: Tuple[float, float] = (0.667, 1.5),
     xy_stretch_range: Tuple[float, float] = (0.8, 1.25),
@@ -314,6 +315,8 @@ def augment_pair_3d(
     Args:
         cube:            Full zarr volume in (x, y, z) axis order
         target_shape:    Output shape in (z, x, y) training order
+        center_xyz:      Optional fixed center in zarr (x, y, z) order used
+                         during extraction. If None, extraction is random.
         z_artifact_margin: z-indices to exclude at the deep end of the zarr
         z_stretch_range:  (min, max) scale factor for the z (time/depth) axis
         xy_stretch_range: (min, max) scale factor for the x and y spatial axes
@@ -347,10 +350,18 @@ def augment_pair_3d(
     ext_x = int(target_x / sx) + 1 if sx < 1.0 else target_x
     ext_y = int(target_y / sy) + 1 if sy < 1.0 else target_y
     ext_z = int(target_z / sz) + 1 if sz < 1.0 else target_z
-    # extract_random_subvolume expects (x, y, z) zarr order
-    raw = extract_random_subvolume(
-        cube, (ext_x, ext_y, ext_z), z_artifact_margin=z_artifact_margin
-    ).astype(np.float32)
+    # Extraction helpers expect (x, y, z) zarr order.
+    if center_xyz is None:
+        raw = extract_random_subvolume(
+            cube, (ext_x, ext_y, ext_z), z_artifact_margin=z_artifact_margin
+        ).astype(np.float32)
+    else:
+        raw = extract_centered_subvolume(
+            cube,
+            (ext_x, ext_y, ext_z),
+            center_xyz=center_xyz,
+            z_artifact_margin=z_artifact_margin,
+        ).astype(np.float32)
     data = np.transpose(raw, (2, 0, 1))  # (ext_x, ext_y, ext_z) → (ext_z, ext_x, ext_y)
 
     # --- Phase rotation along z before normalisation ---
@@ -474,4 +485,41 @@ def extract_random_subvolume(
         start_z:start_z + target_shape[2]
     ]
     
+    return subvolume
+
+
+def extract_centered_subvolume(
+    volume: np.ndarray,
+    target_shape: Tuple[int, int, int],
+    center_xyz: Tuple[int, int, int],
+    z_artifact_margin: int = 0,
+) -> np.ndarray:
+    """Extract a subvolume centered at ``center_xyz`` in zarr (x, y, z) order."""
+    vol_shape = volume.shape
+
+    max_x = vol_shape[0] - target_shape[0]
+    max_y = vol_shape[1] - target_shape[1]
+    max_z = (vol_shape[2] - z_artifact_margin) - target_shape[2]
+
+    if max_x < 0 or max_y < 0 or max_z < 0:
+        raise ValueError(
+            f"Target shape {target_shape} larger than usable volume {vol_shape} "
+            f"(z_artifact_margin={z_artifact_margin})"
+        )
+
+    cx, cy, cz = [int(v) for v in center_xyz]
+    hx = target_shape[0] // 2
+    hy = target_shape[1] // 2
+    hz = target_shape[2] // 2
+
+    start_x = min(max(0, cx - hx), max_x)
+    start_y = min(max(0, cy - hy), max_y)
+    start_z = min(max(0, cz - hz), max_z)
+
+    subvolume = volume[
+        start_x:start_x + target_shape[0],
+        start_y:start_y + target_shape[1],
+        start_z:start_z + target_shape[2],
+    ]
+
     return subvolume

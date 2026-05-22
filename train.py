@@ -1032,6 +1032,11 @@ DEFAULT_ARRAY_KEYS = [
     "seismicCubes_cumsum_fullstack_noise_free"
 ]
 
+DEFAULT_GEOLOGIC_SCORE_KEYS = [
+    "geological_score",
+    "geologic_score",
+]
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train Seismic 3D Mamba")
@@ -1043,6 +1048,66 @@ def main():
                        help="Glob pattern relative to --data_folder for zarr discovery (default: seismic__*/model_data.zarr)")
     parser.add_argument("--array_keys", type=str, nargs='+', default=DEFAULT_ARRAY_KEYS,
                        help="One or more 3D array keys inside each Zarr dataset; one is picked randomly per sample")
+    parser.add_argument(
+        "--disable_geologic_score_sampling",
+        action="store_true",
+        help="Disable geologic-score-driven center selection and fall back to fully random crop centers.",
+    )
+    parser.add_argument(
+        "--geologic_score_min",
+        type=float,
+        default=0.5,
+        help="Minimum geologic score required for candidate points (default: 0.5).",
+    )
+    parser.add_argument(
+        "--geologic_score_keys",
+        type=str,
+        nargs='+',
+        default=DEFAULT_GEOLOGIC_SCORE_KEYS,
+        help="Candidate zarr keys for geologic score volume lookup (first found is used).",
+    )
+    parser.add_argument(
+        "--geologic_points_json_name",
+        type=str,
+        default="geologic_score_selected_points.json",
+        help="Filename for persisted ranked geologic-score points beside each dataset.",
+    )
+    parser.add_argument(
+        "--geologic_val_center_json_name",
+        type=str,
+        default="geologic_score_val_center.json",
+        help="Filename for persisted validation center beside each dataset.",
+    )
+    parser.add_argument(
+        "--geologic_target_points",
+        type=int,
+        default=500,
+        help="Target number of ranked points to persist per dataset (default: 500).",
+    )
+    parser.add_argument(
+        "--geologic_candidate_count",
+        type=int,
+        default=3000,
+        help="Number of spread candidates generated before score filtering (default: 3000).",
+    )
+    parser.add_argument(
+        "--geologic_candidate_probes",
+        type=int,
+        default=24,
+        help="Probe count per best-candidate step when generating spread points (default: 24).",
+    )
+    parser.add_argument(
+        "--geologic_dist_thresh_start",
+        type=int,
+        default=96,
+        help="Initial distance threshold for ranked-point diversity selection (default: 96).",
+    )
+    parser.add_argument(
+        "--geologic_dist_thresh_floor",
+        type=int,
+        default=32,
+        help="Distance threshold floor for diversity backoff (default: 32).",
+    )
     parser.add_argument("--val_split_ratio", type=float, default=0.2,
                        help="Validation split ratio over discovered datasets (default: 0.2)")
     parser.add_argument("--train_batches_per_epoch", type=int, default=None,
@@ -1327,6 +1392,16 @@ def main():
         target_std=1.0,
         trace_mask_ratio=0.07,
         array_keys=args.array_keys,
+        geologic_score_sampling=(not args.disable_geologic_score_sampling),
+        geologic_score_min=float(args.geologic_score_min),
+        geologic_score_key_candidates=args.geologic_score_keys,
+        geologic_points_json_name=args.geologic_points_json_name,
+        geologic_val_center_json_name=args.geologic_val_center_json_name,
+        geologic_target_points=int(args.geologic_target_points),
+        geologic_candidate_count=int(args.geologic_candidate_count),
+        geologic_candidate_probes=int(args.geologic_candidate_probes),
+        geologic_dist_thresh_start=int(args.geologic_dist_thresh_start),
+        geologic_dist_thresh_floor=int(args.geologic_dist_thresh_floor),
     )
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
