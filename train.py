@@ -35,6 +35,7 @@ from synthoseis_pre_train.gpu_utils import (
     get_cpu_temperature_c,
     get_thermal_pressure_level,
 )
+from synthoseis_pre_train.losses import SSIMHybridLoss3D
 from synthoseis_pre_train.models import create_model, _MAMBA_AVAILABLE
 from synthoseis_pre_train.plotting import make_4panel_figure, make_crosssection_figure
 
@@ -317,6 +318,26 @@ def _collect_cli_option_names(argv: list[str]) -> set[str]:
     return provided
 
 
+def _build_criterion(args) -> nn.Module:
+    """Return the loss criterion selected via --loss."""
+    loss_fn = getattr(args, "loss", "huber")
+    if loss_fn == "mse":
+        return nn.MSELoss()
+    if loss_fn == "mae":
+        return nn.L1Loss()
+    if loss_fn == "huber":
+        delta = float(getattr(args, "huber_delta", 1.0))
+        return nn.SmoothL1Loss(beta=delta)
+    if loss_fn == "ssim":
+        return SSIMHybridLoss3D(
+            window_size=int(getattr(args, "ssim_window_size", 7)),
+            w1=float(getattr(args, "ssim_w1", 1.0)),
+            w2=float(getattr(args, "ssim_w2", 0.0)),
+            w3=float(getattr(args, "ssim_w3", 0.0)),
+        )
+    raise ValueError(f"Unknown loss function: {loss_fn!r}")
+
+
 def _print_loss_and_backprop_summary(
     args,
     cli_provided: set[str],
@@ -356,7 +377,28 @@ def _print_loss_and_backprop_summary(
             _kv("poly power", f"{args.lr_poly_power:g}")
 
     print("  Loss and backprop:")
-    _kv("loss", "MSE over unmasked voxels (fixed)")
+    _loss_name = getattr(args, "loss", "huber")
+    if _loss_name == "huber":
+        _delta = float(getattr(args, "huber_delta", 1.0))
+        _loss_desc = (
+            f"huber/SmoothL1 (delta={_delta:g}, "
+            f"{_src('huber_delta')}, default={defaults['huber_delta']:g})"
+        )
+    elif _loss_name == "ssim":
+        _loss_desc = "ssim-hybrid"
+    else:
+        _loss_desc = _loss_name
+    _kv("loss", f"{_loss_desc} ({_src('loss')}, default={defaults['loss']})")
+    if _loss_name == "ssim":
+        _ssim_window = int(getattr(args, "ssim_window_size", 7))
+        _ssim_w1 = float(getattr(args, "ssim_w1", 1.0))
+        _ssim_w2 = float(getattr(args, "ssim_w2", 0.0))
+        _ssim_w3 = float(getattr(args, "ssim_w3", 0.0))
+        print(f"{' ':4}{' ':<{label_width}}   - window={_ssim_window},")
+        print(
+            f"{' ':4}{' ':<{label_width}}   - weights: "
+            f"(ssim_term={_ssim_w1:g}, mse_term={_ssim_w2:g}, mae_term={_ssim_w3:g})"
+        )
     _kv("AMP", f"{'on' if amp_enabled else 'off'} (auto)")
     _kv(
         "grad_accum_steps",
@@ -780,7 +822,11 @@ def train_epoch(
 
         with autocast_context(device):
             output = model(input_data)
-            loss = criterion(output[~mask], target[~mask])
+            # loss = criterion(output[~mask], target[~mask])
+            loss = criterion(output, target)  # TODO: switch to masked loss when stable ?
+        if batch_idx < 10:
+            masked_output = output[~mask]
+            print(f"          . output[~mask] size: {tuple(masked_output.shape)} | output size: {tuple(output.shape)} | ratio: {masked_output.numel() / output.numel() * 100:.2f} percent")
         batch_loss = loss.item()
         scaled_loss = loss / accum_steps
 
@@ -1139,12 +1185,72 @@ def main():
                        help="Gradient accumulation steps (effective batch = batch_size * this value)")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0,
                        help="Clip gradient global norm to this value; set <=0 to disable")
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="huber",
+        choices=["mse", "mae", "huber", "ssim"],
+        help=(
+            "Loss function: mse (MSELoss), mae (L1Loss), huber (SmoothL1Loss), "
+            "or ssim (w1*(1-SSIM)+w2*MSE+w3*L1 over 3D volumes) (default: huber)"
+        ),
+    )
+    parser.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="Delta parameter for SmoothL1Loss when --loss=huber (default: 1.0)",
+    )
+    parser.add_argument(
+        "--ssim_window_size",
+        type=int,
+        default=7,
+        help="Odd cubic SSIM window edge length for --loss=ssim (default: 7)",
+    )
+    parser.add_argument(
+        "--ssim_w1",
+        type=float,
+        default=1.0,
+        help="Weight w1 for (1-SSIM) in hybrid SSIM loss (default: 1.0)",
+    )
+    parser.add_argument(
+        "--ssim_w2",
+        type=float,
+        default=0.0,
+        help="Weight w2 for MSE term in hybrid SSIM loss (default: 0.0)",
+    )
+    parser.add_argument(
+        "--ssim_w3",
+        type=float,
+        default=0.0,
+        help="Weight w3 for L1 term in hybrid SSIM loss (default: 0.0)",
+    )
     parser.add_argument("--ema_decay", type=float, default=0.999,
                        help="EMA decay for model weights; set <=0 to disable")
     parser.add_argument("--ema_update_every", type=int, default=1,
                        help="Update EMA every N optimizer steps (default: 1)")
     parser.add_argument("--sample_shape", type=int, nargs=3, default=[128, 128, 128],
                        help="Sample shape (x y z)")
+    parser.add_argument(
+        "--hidden_dims",
+        type=int,
+        nargs='+',
+        default=[32, 64, 128, 256],
+        help=(
+            "Channel widths per encoder stage (e.g. --hidden_dims 32 64 128 256). "
+            "Number of values determines U-Net depth. Default: 32 64 128 256."
+        ),
+    )
+    parser.add_argument(
+        "--kernel_sizes",
+        type=int,
+        nargs='+',
+        default=None,
+        help=(
+            "Optional odd kernel schedule per hidden-dim stage (e.g. --kernel_sizes 7 5 3 3). "
+            "Length must match model hidden dims. Default keeps legacy 3x3 kernels."
+        ),
+    )
     parser.add_argument("--device", type=str, default="auto",
                        help="Device (auto, cuda, mps, cpu)")
     parser.add_argument("--resume", type=str, default=None,
@@ -1166,6 +1272,12 @@ def main():
     backprop_defaults = {
         "lr": parser.get_default("lr"),
         "lr_schedule": parser.get_default("lr_schedule"),
+        "loss": parser.get_default("loss"),
+        "huber_delta": parser.get_default("huber_delta"),
+        "ssim_window_size": parser.get_default("ssim_window_size"),
+        "ssim_w1": parser.get_default("ssim_w1"),
+        "ssim_w2": parser.get_default("ssim_w2"),
+        "ssim_w3": parser.get_default("ssim_w3"),
         "grad_accum_steps": parser.get_default("grad_accum_steps"),
         "grad_clip_norm": parser.get_default("grad_clip_norm"),
         "ema_decay": parser.get_default("ema_decay"),
@@ -1180,6 +1292,24 @@ def main():
         parser.error("--val_batches_per_epoch must be > 0")
     if args.refresh_every_batches < 0:
         parser.error("--refresh_every_batches must be >= 0")
+    if args.kernel_sizes is not None:
+        hidden_dims_val = tuple(args.hidden_dims)
+        if len(args.kernel_sizes) != len(hidden_dims_val):
+            parser.error(
+                "--kernel_sizes length must match hidden dims "
+                f"({len(hidden_dims_val)} values expected for {hidden_dims_val})"
+            )
+        if any(k <= 0 or k % 2 == 0 for k in args.kernel_sizes):
+            parser.error("--kernel_sizes values must be positive odd integers")
+    if args.ssim_window_size < 3 or args.ssim_window_size % 2 == 0:
+        parser.error("--ssim_window_size must be an odd integer >= 3")
+    if min(args.sample_shape) < args.ssim_window_size:
+        parser.error(
+            "--ssim_window_size must be <= each sample_shape dimension "
+            f"(got window={args.ssim_window_size}, sample_shape={tuple(args.sample_shape)})"
+        )
+    if args.loss == "ssim" and (args.ssim_w1 < 0 or args.ssim_w2 < 0 or args.ssim_w3 < 0):
+        parser.error("--ssim_w1, --ssim_w2, and --ssim_w3 must be >= 0")
 
     if not args.data_paths and not args.data_folder:
         parser.error("At least one of --data_paths or --data_folder must be provided")
@@ -1288,10 +1418,16 @@ def main():
     print("Creating model...")
     if args.use_mamba and not _MAMBA_AVAILABLE:
         print("WARNING: --use_mamba requested but mamba_ssm not installed; falling back to ResBlock3d")
+    if args.kernel_sizes is None:
+        print("Kernel schedule: default legacy 3x3 across stages")
+    else:
+        print(f"Kernel schedule: {tuple(args.kernel_sizes)}")
+    print(f"Channels schedule: {tuple(args.hidden_dims)}")
     model = create_model(
         use_mamba=args.use_mamba,
         input_channels=1,
-        hidden_dims=(32, 64, 128, 256),
+        hidden_dims=tuple(args.hidden_dims),
+        kernel_sizes=tuple(args.kernel_sizes) if args.kernel_sizes is not None else None,
         spatial_size=tuple(args.sample_shape),
     ).to(device)
 
@@ -1304,16 +1440,14 @@ def main():
     fixed_bytes    = weights_bytes + grads_bytes + adam_bytes
 
     S = args.sample_shape
-    hidden = (32, 64, 128, 256)
+    hidden = tuple(args.hidden_dims)
+    n = len(hidden)
     def _fm(b, c, s): return b * c * s[0] * s[1] * s[2] * 4
-    act_per_sample = 2 * (
-        _fm(1, hidden[0], S)
-        + _fm(1, hidden[1], [d//2 for d in S])
-        + _fm(1, hidden[2], [d//4 for d in S])
-        + _fm(1, hidden[3], [d//8 for d in S])
-        + _fm(1, hidden[2], [d//4 for d in S])
-        + _fm(1, hidden[1], [d//2 for d in S])
-        + _fm(1, hidden[0], S)
+    # Encoder scales [0..n-1] + decoder mirrors [n-2..0]
+    _scales = list(range(n)) + list(range(n - 2, -1, -1))
+    act_per_sample = 2 * sum(
+        _fm(1, hidden[i], [d // (2 ** i) for d in S])
+        for i in _scales
     )
     io_per_sample  = 2 * int(np.prod(S)) * 4
     per_sample_var = act_per_sample + io_per_sample
@@ -1405,7 +1539,7 @@ def main():
     )
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.MSELoss()
+    criterion = _build_criterion(args)
     scaler = create_grad_scaler(device)
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
     _print_loss_and_backprop_summary(args, cli_provided, backprop_defaults, scaler)

@@ -29,6 +29,7 @@ def _to_numpy(vol) -> np.ndarray:
 def _symrange(*arrays) -> tuple:
     """Return (-v, v) where v = max absolute value across all arrays."""
     vmax = max(float(np.abs(a).max()) for a in arrays)
+    vmax = 3.30  # TODO: remove? fix it since all arrays being plotted are supposed to conform to standard normal
     return (-vmax or -1.0, vmax or 1.0)
 
 
@@ -50,6 +51,13 @@ def make_4panel_figure(input_vol, output_vol, label_vol, suptitle: str) -> Figur
     out = _to_numpy(output_vol)
     lbl = _to_numpy(label_vol)
 
+    # Least-squares linear fit: lbl ≈ ls_scale * out + ls_offset  (on full volume)
+    out_flat = out.ravel()
+    lbl_flat = lbl.ravel()
+    A = np.stack([out_flat, np.ones_like(out_flat)], axis=1)
+    coeffs, _, _, _ = np.linalg.lstsq(A, lbl_flat, rcond=None)
+    ls_scale, ls_offset = float(coeffs[0]), float(coeffs[1])
+
     cx = inp.shape[1] // 2  # center X index
     cy = inp.shape[2] // 2  # center Y index
 
@@ -62,7 +70,11 @@ def make_4panel_figure(input_vol, output_vol, label_vol, suptitle: str) -> Figur
     out_cy = out[:, :, cy]
     lbl_cy = lbl[:, :, cy]
 
-    vmin, vmax = _symrange(inp_cx, out_cx, lbl_cx, inp_cy, out_cy, lbl_cy)
+    # Apply fit to output cross-sections for middle-column display
+    out_cx_fit = ls_scale * out_cx + ls_offset
+    out_cy_fit = ls_scale * out_cy + ls_offset
+
+    vmin, vmax = _symrange(inp_cx, out_cx_fit, lbl_cx, inp_cy, out_cy_fit, lbl_cy)
     imkw = dict(aspect="auto", cmap="gray", vmin=vmin, vmax=vmax, origin="upper")
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
@@ -72,10 +84,17 @@ def make_4panel_figure(input_vol, output_vol, label_vol, suptitle: str) -> Figur
     axes[0, 0].set_xlabel("Y")
     axes[0, 0].set_ylabel("Z (time/depth)")
 
-    axes[0, 1].imshow(out_cx, **imkw)
-    axes[0, 1].set_title("ŷ (output) — center-X  (ZY)")
+    axes[0, 1].imshow(out_cx_fit, **imkw)
+    axes[0, 1].set_title("ŷ (output, LS-scaled) — center-X  (ZY)")
     axes[0, 1].set_xlabel("Y")
     axes[0, 1].set_ylabel("Z (time/depth)")
+    axes[0, 1].text(
+        0.03, 0.04,
+        f"scale={ls_scale:5.2f}  offset={ls_offset:5.2f}",
+        transform=axes[0, 1].transAxes,
+        fontsize=8, color="white",
+        bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5),
+    )
 
     axes[0, 2].imshow(lbl_cx, **imkw)
     axes[0, 2].set_title("y (label) — center-X  (ZY)")
@@ -87,10 +106,17 @@ def make_4panel_figure(input_vol, output_vol, label_vol, suptitle: str) -> Figur
     axes[1, 0].set_xlabel("X")
     axes[1, 0].set_ylabel("Z (time/depth)")
 
-    axes[1, 1].imshow(out_cy, **imkw)
-    axes[1, 1].set_title("ŷ (output) — center-Y  (ZX)")
+    axes[1, 1].imshow(out_cy_fit, **imkw)
+    axes[1, 1].set_title("ŷ (output, LS-scaled) — center-Y  (ZX)")
     axes[1, 1].set_xlabel("X")
     axes[1, 1].set_ylabel("Z (time/depth)")
+    axes[1, 1].text(
+        0.03, 0.04,
+        f"scale={ls_scale:5.2f}  offset={ls_offset:5.2f}",
+        transform=axes[1, 1].transAxes,
+        fontsize=8, color="white",
+        bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.5),
+    )
 
     axes[1, 2].imshow(lbl_cy, **imkw)
     axes[1, 2].set_title("y (label) — center-Y  (ZX)")

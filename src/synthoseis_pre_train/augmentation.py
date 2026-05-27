@@ -271,12 +271,29 @@ def random_augmentation_3d(
         noise_scale = np.std(augmented) * 0.02
         augmented = augmented + np.random.normal(0.0, noise_scale, augmented.shape)
 
+    def _moments_stats(arr: np.ndarray) -> Tuple[float, float, float, float]:
+        """Return (mean, std, skewness, kurtosis[pearson]) for a numeric array."""
+        mean_v = float(np.mean(arr))
+        std_v = float(np.std(arr))
+        if std_v <= 0.0:
+            return mean_v, std_v, 0.0, 3.0
+        centered = (arr - mean_v) / std_v
+        skew_v = float(np.mean(centered ** 3))
+        kurt_v = float(np.mean(centered ** 4))
+        return mean_v, std_v, skew_v, kurt_v
+
     if normalize:
+        before_mean, before_std, before_skew, before_kurt = _moments_stats(augmented)
         mean = np.mean(augmented)
         mean = 0.0 # Centering to zero mean for seismic data
         std = np.std(augmented)
         if std > 0:
             augmented = (augmented - mean) / std * target_std
+        after_mean, after_std, after_skew, after_kurt = _moments_stats(augmented)
+        print(
+            f"          . before: ({before_mean:.2f}, {before_std:.2f}, {before_skew:.2f}, {before_kurt:.2f}) "
+            f". after: ({after_mean:.2f}, {after_std:.2f}, {after_skew:.2f}, {after_kurt:.2f})"
+        )
 
     params = {
         'stretch_factors': (sx, sy, sz),

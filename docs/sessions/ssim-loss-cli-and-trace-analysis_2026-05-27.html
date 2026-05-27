@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Session Summary: SSIM Loss, CLI Wiring, and Trace Analysis Updates</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      margin: 2rem auto;
+      max-width: 980px;
+      line-height: 1.5;
+      color: #1f2937;
+      padding: 0 1rem;
+    }
+    h1, h2 { color: #111827; }
+    code {
+      background: #f3f4f6;
+      padding: 0.1rem 0.3rem;
+      border-radius: 4px;
+    }
+    .meta {
+      background: #f9fafb;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      margin: 1rem 0;
+    }
+    ul { margin-top: 0.4rem; }
+  </style>
+</head>
+<body>
+  <h1>Session Summary: SSIM Loss, CLI Wiring, and Trace Analysis Updates</h1>
+
+  <h2>Context and Goals</h2>
+  <div class="meta">
+    <ul>
+      <li>Date: 2026-05-27</li>
+      <li>Branch: test/basic-unet-w-mse</li>
+      <li>Base commit at session-start: 223ff8b</li>
+    </ul>
+  </div>
+  <ul>
+    <li>Add 3D SSIM hybrid loss for seismic reconstruction with configurable weights.</li>
+    <li>Update train entrypoints and shell wrapper to expose SSIM and kernel/channel controls.</li>
+    <li>Improve training stdout clarity for SSIM component naming.</li>
+    <li>Extend synthetic trace study script with robust filtering, tapering, extrema counting, and batch CSV export.</li>
+    <li>Keep model/kernel scheduling and related tests aligned with new CLI/runtime behavior.</li>
+  </ul>
+
+  <h2>What Was Done</h2>
+  <ul>
+    <li>Added new 3D SSIM hybrid loss module: <code>src/synthoseis_pre_train/losses.py</code>.</li>
+    <li>Updated training and CLI plumbing: <code>train.py</code>, <code>train_multi_datasets.sh</code>.</li>
+    <li>Updated model/kernel schedule behavior and defaults: <code>src/synthoseis_pre_train/models.py</code>, <code>tests/test_model_kernel_defaults.py</code>.</li>
+    <li>Updated data/diagnostic behavior and plotting: <code>src/synthoseis_pre_train/augmentation.py</code>, <code>src/synthoseis_pre_train/plotting.py</code>.</li>
+    <li>Added and evolved study script workflow: <code>studies/trace_exponential_rfc.py</code>.</li>
+  </ul>
+
+  <h2>How It Was Done</h2>
+  <ul>
+    <li>Implemented <code>SSIMHybridLoss3D</code> on 5D tensors (N,C,D,H,W) using cubic Gaussian window (default 7x7x7).</li>
+    <li>Implemented hybrid objective: <code>w1 * (1 - SSIM) + w2 * MSE + w3 * L1</code>.</li>
+    <li>Normalized seismic amplitudes for SSIM using <code>x01 = clamp(x / 20 + 0.5, 0, 1)</code> to map approx [-10, 10] to [0, 1].</li>
+    <li>Used standard SSIM constants consistent with common implementations/literature: K1=0.01, K2=0.03, L=1.</li>
+    <li>Added train CLI args: <code>--loss ssim</code>, <code>--ssim_window_size</code>, <code>--ssim_w1</code>, <code>--ssim_w2</code>, <code>--ssim_w3</code>.</li>
+    <li>Added runtime guards for valid SSIM window and weights.</li>
+    <li>Updated stdout summary to use named terms: <code>ssim_term</code>, <code>mse_term</code>, <code>mae_term</code>.</li>
+    <li>Corrected study filtering and added extrema statistics plus 200-run CSV batch mode.</li>
+  </ul>
+
+  <h2>When and By Whom</h2>
+  <ul>
+    <li>When: 2026-05-27, during a single agentic coding session with iterative validation.</li>
+    <li>By whom: User (donaldpg) and GitHub Copilot (GPT-5.3-Codex).</li>
+  </ul>
+
+  <h2>Basic Info</h2>
+  <ul>
+    <li>Relevant commits: base at session start = <code>223ff8b</code>; session commit created after summary generation (see <code>git log -1</code>).</li>
+    <li>Files involved:
+      <ul>
+        <li><code>src/synthoseis_pre_train/augmentation.py</code></li>
+        <li><code>src/synthoseis_pre_train/models.py</code></li>
+        <li><code>src/synthoseis_pre_train/plotting.py</code></li>
+        <li><code>train.py</code></li>
+        <li><code>train_multi_datasets.sh</code></li>
+        <li><code>src/synthoseis_pre_train/losses.py</code></li>
+        <li><code>studies/trace_exponential_rfc.py</code></li>
+        <li><code>tests/test_model_kernel_defaults.py</code></li>
+      </ul>
+    </li>
+    <li>Summary artifacts:
+      <ul>
+        <li><code>docs/sessions/ssim-loss-cli-and-trace-analysis_2026-05-27.md</code></li>
+        <li><code>docs/sessions/ssim-loss-cli-and-trace-analysis_2026-05-27.html</code></li>
+      </ul>
+    </li>
+  </ul>
+
+  <h2>Next / Follow-Up Suggestions</h2>
+  <ul>
+    <li>Add unit tests for <code>SSIMHybridLoss3D</code> invariants (identical tensors, window guards, channel averaging).</li>
+    <li>Add CLI presets for common hybrid settings (pure SSIM, SSIM+MSE, SSIM+L1).</li>
+    <li>Revisit hardcoded plotting bounds if not intended long-term.</li>
+    <li>Track clipping ratio in SSIM normalization to decide if amplitude-range assumptions need recalibration.</li>
+  </ul>
+</body>
+</html>

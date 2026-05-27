@@ -29,7 +29,28 @@ Transfer learning workflow::
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _grad_ckpt
-from typing import List, Tuple
+from typing import List, Tuple, cast
+
+
+def _same_padding_3d(kernel_size: int) -> int:
+    """Return symmetric padding for stride-1 odd kernels that preserves shape."""
+    if kernel_size <= 0 or kernel_size % 2 == 0:
+        raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}")
+    return kernel_size // 2
+
+
+def _resolve_stage_kernel_sizes(hidden_dims: Tuple[int, ...], kernel_sizes: Tuple[int, ...] | None) -> Tuple[int, ...]:
+    """Return one odd kernel size per encoder stage (same length as hidden_dims)."""
+    if kernel_sizes is None:
+        return tuple(3 for _ in hidden_dims)
+    if len(kernel_sizes) != len(hidden_dims):
+        raise ValueError(
+            "kernel_sizes must have the same length as hidden_dims "
+            f"(got {len(kernel_sizes)} vs {len(hidden_dims)})"
+        )
+    for k in kernel_sizes:
+        _same_padding_3d(k)  # validates odd positive kernel sizes
+    return kernel_sizes
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +60,12 @@ from typing import List, Tuple
 class ResBlock3d(nn.Module):
     """Two Conv3d layers with a residual skip connection."""
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3):
         super().__init__()
-        self.conv1 = nn.Conv3d(in_channels, out_channels, 3, padding=1, bias=False)
+        padding = _same_padding_3d(kernel_size)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, padding=padding, bias=False)
         self.norm1 = nn.InstanceNorm3d(out_channels, affine=True)
-        self.conv2 = nn.Conv3d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size, padding=padding, bias=False)
         self.norm2 = nn.InstanceNorm3d(out_channels, affine=True)
         self.act = nn.GELU()
         self.proj = (
@@ -67,7 +89,7 @@ try:
     from mamba_ssm import Mamba  # type: ignore
     _MAMBA_AVAILABLE = True
 except ImportError:
-    pass
+    Mamba = None  # type: ignore[assignment]
 
 
 class MambaBlock3d(nn.Module):
@@ -83,19 +105,35 @@ class MambaBlock3d(nn.Module):
     Falls back to ResBlock3d automatically if mamba_ssm is not installed.
     """
 
-    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    def __init__(
+        self,
+        channels: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        kernel_size: int = 3,
+    ):
         super().__init__()
+        padding = _same_padding_3d(kernel_size)
         if not _MAMBA_AVAILABLE:
-            self._block = ResBlock3d(channels, channels)
+            self._block = ResBlock3d(channels, channels, kernel_size=kernel_size)
             self._use_mamba = False
             return
 
         self._use_mamba = True
         # Local CNN branch (depthwise)
-        self.dw_conv = nn.Conv3d(channels, channels, 3, padding=1, groups=channels, bias=False)
+        self.dw_conv = nn.Conv3d(
+            channels,
+            channels,
+            kernel_size,
+            padding=padding,
+            groups=channels,
+            bias=False,
+        )
         self.dw_norm = nn.InstanceNorm3d(channels, affine=True)
         # SSM branch
         self.seq_norm = nn.LayerNorm(channels)
+        assert Mamba is not None
         self.mamba = Mamba(d_model=channels, d_state=d_state, d_conv=d_conv, expand=expand)
         # Output
         self.out_norm = nn.InstanceNorm3d(channels, affine=True)
@@ -139,37 +177,45 @@ class UNetEncoder3d(nn.Module):
         self,
         in_channels: int,
         hidden_dims: Tuple[int, ...],
+        kernel_sizes: Tuple[int, ...] | None = None,
         use_mamba: bool = False,
         use_checkpoint: bool = True,
     ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
-        self.stem = ResBlock3d(in_channels, hidden_dims[0])
+        stage_kernels = _resolve_stage_kernel_sizes(hidden_dims, kernel_sizes)
+        self.stem = ResBlock3d(in_channels, hidden_dims[0], kernel_size=stage_kernels[0])
 
         self.downsamples = nn.ModuleList()
         self.enc_blocks = nn.ModuleList()
         for i in range(len(hidden_dims) - 1):
             cin, cout = hidden_dims[i], hidden_dims[i + 1]
             self.downsamples.append(nn.Conv3d(cin, cout, kernel_size=2, stride=2, bias=False))
-            self.enc_blocks.append(MambaBlock3d(cout) if use_mamba else ResBlock3d(cout, cout))
+            block_kernel = stage_kernels[i + 1]
+            self.enc_blocks.append(
+                MambaBlock3d(cout, kernel_size=block_kernel)
+                if use_mamba
+                else ResBlock3d(cout, cout, kernel_size=block_kernel)
+            )
 
         bot_ch = hidden_dims[-1]
-        self.bottleneck = MambaBlock3d(bot_ch) if use_mamba else ResBlock3d(bot_ch, bot_ch)
+        # Keep bottleneck conservative; most receptive-field growth happens from depth.
+        self.bottleneck = MambaBlock3d(bot_ch, kernel_size=3) if use_mamba else ResBlock3d(bot_ch, bot_ch, kernel_size=3)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         ckpt = self.use_checkpoint and torch.is_grad_enabled()
         skips: List[torch.Tensor] = []
-        x = _grad_ckpt(self.stem, x, use_reentrant=False) if ckpt else self.stem(x)
+        x = cast(torch.Tensor, _grad_ckpt(self.stem, x, use_reentrant=False)) if ckpt else self.stem(x)
         skips.append(x)
 
         for down, block in zip(self.downsamples, self.enc_blocks):
             x = down(x)
-            x = _grad_ckpt(block, x, use_reentrant=False) if ckpt else block(x)
+            x = cast(torch.Tensor, _grad_ckpt(block, x, use_reentrant=False)) if ckpt else block(x)
             skips.append(x)
 
         # Deepest entry goes through bottleneck; removed from skips list
         bot_in = skips.pop()
-        x = _grad_ckpt(self.bottleneck, bot_in, use_reentrant=False) if ckpt else self.bottleneck(bot_in)
+        x = cast(torch.Tensor, _grad_ckpt(self.bottleneck, bot_in, use_reentrant=False)) if ckpt else self.bottleneck(bot_in)
         return x, skips  # skips: [shallow, ..., second-deepest]
 
 
@@ -191,9 +237,15 @@ class UNetDecoder3d(nn.Module):
     Output spatial size = input spatial size (128×128×128 in, 128×128×128 out).
     """
 
-    def __init__(self, hidden_dims: Tuple[int, ...], use_checkpoint: bool = True):
+    def __init__(
+        self,
+        hidden_dims: Tuple[int, ...],
+        kernel_sizes: Tuple[int, ...] | None = None,
+        use_checkpoint: bool = True,
+    ):
         super().__init__()
         self.use_checkpoint = use_checkpoint
+        stage_kernels = _resolve_stage_kernel_sizes(hidden_dims, kernel_sizes)
         dims = list(reversed(hidden_dims))  # e.g. [256, 128, 64, 32]
         self.upsamples = nn.ModuleList()
         self.dec_blocks = nn.ModuleList()
@@ -202,14 +254,15 @@ class UNetDecoder3d(nn.Module):
             self.upsamples.append(
                 nn.ConvTranspose3d(deep_ch, skip_ch, kernel_size=2, stride=2, bias=False)
             )
-            self.dec_blocks.append(ResBlock3d(2 * skip_ch, skip_ch))
+            # Decoder kernels mirror encoder scale kernels from deep->shallow.
+            self.dec_blocks.append(ResBlock3d(2 * skip_ch, skip_ch, kernel_size=stage_kernels[-(i + 2)]))
 
     def forward(self, x: torch.Tensor, skips: List[torch.Tensor]) -> torch.Tensor:
         ckpt = self.use_checkpoint and torch.is_grad_enabled()
         for up, block, skip in zip(self.upsamples, self.dec_blocks, reversed(skips)):
             x = up(x)
             x = torch.cat([x, skip], dim=1)
-            x = _grad_ckpt(block, x, use_reentrant=False) if ckpt else block(x)
+            x = cast(torch.Tensor, _grad_ckpt(block, x, use_reentrant=False)) if ckpt else block(x)
         return x
 
 
@@ -236,13 +289,14 @@ class SeismicUNet3d(nn.Module):
         self,
         input_channels: int = 1,
         hidden_dims: Tuple[int, ...] = (32, 64, 128, 256),
+        kernel_sizes: Tuple[int, ...] | None = None,
         spatial_size: Tuple[int, int, int] = (128, 128, 128),
         use_mamba: bool = False,
         use_checkpoint: bool = True,
     ):
         super().__init__()
-        self.encoder = UNetEncoder3d(input_channels, hidden_dims, use_mamba, use_checkpoint)
-        self.decoder = UNetDecoder3d(hidden_dims, use_checkpoint)
+        self.encoder = UNetEncoder3d(input_channels, hidden_dims, kernel_sizes, use_mamba, use_checkpoint)
+        self.decoder = UNetDecoder3d(hidden_dims, kernel_sizes, use_checkpoint)
         self.head = nn.Conv3d(hidden_dims[0], input_channels, kernel_size=1)
         self._head_type = self.HEAD_RECONSTRUCTION
 
@@ -292,6 +346,7 @@ class SeismicUNet3d(nn.Module):
 def create_model(
     use_mamba: bool = False,
     use_checkpoint: bool = True,
+    kernel_sizes: Tuple[int, ...] | None = None,
     **kwargs,
 ) -> SeismicUNet3d:
     """
@@ -305,7 +360,16 @@ def create_model(
                    Trades ~3-4x less activation memory for ~20% slower training
                    (backward recomputes each block's forward pass).
                    Default True; disable only if you have memory to spare.
+        kernel_sizes: Optional per-scale odd kernel schedule with same length as
+                   ``hidden_dims`` (e.g., (7, 5, 3, 3) for (16, 32, 64, 128)).
+                   Larger kernels are applied in shallow encoder/decoder stages.
+                   Bottleneck remains fixed at 3.
         **kwargs:  Forwarded to SeismicUNet3d:
                    ``input_channels``, ``hidden_dims``, ``spatial_size``.
     """
-    return SeismicUNet3d(use_mamba=use_mamba, use_checkpoint=use_checkpoint, **kwargs)
+    return SeismicUNet3d(
+        use_mamba=use_mamba,
+        use_checkpoint=use_checkpoint,
+        kernel_sizes=kernel_sizes,
+        **kwargs,
+    )

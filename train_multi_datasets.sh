@@ -57,6 +57,14 @@ GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS:-1}
 GRAD_CLIP_NORM=${GRAD_CLIP_NORM:-1.0}
 EMA_DECAY=${EMA_DECAY:-0.999}
 EMA_UPDATE_EVERY=${EMA_UPDATE_EVERY:-1}
+KERNEL_SIZES=${KERNEL_SIZES:-""}
+HIDDEN_DIMS=${HIDDEN_DIMS:-"32 64 128 256"}
+LOSS=${LOSS:-"huber"}
+HUBER_DELTA=${HUBER_DELTA:-1.0}
+SSIM_WINDOW_SIZE=${SSIM_WINDOW_SIZE:-7}
+SSIM_W1=${SSIM_W1:-1.0}
+SSIM_W2=${SSIM_W2:-0.0}
+SSIM_W3=${SSIM_W3:-0.0}
 RESUME=${RESUME:-""}
 
 # Parse command line arguments
@@ -150,6 +158,38 @@ while [[ $# -gt 0 ]]; do
       EMA_UPDATE_EVERY="$2"
       shift 2
       ;;
+    --kernel-sizes)
+      KERNEL_SIZES="$2"
+      shift 2
+      ;;
+    --hidden-dims)
+      HIDDEN_DIMS="$2"
+      shift 2
+      ;;
+    --loss-fn)
+      LOSS="$2"
+      shift 2
+      ;;
+    --huber-delta)
+      HUBER_DELTA="$2"
+      shift 2
+      ;;
+    --ssim-window-size)
+      SSIM_WINDOW_SIZE="$2"
+      shift 2
+      ;;
+    --ssim-w1)
+      SSIM_W1="$2"
+      shift 2
+      ;;
+    --ssim-w2)
+      SSIM_W2="$2"
+      shift 2
+      ;;
+    --ssim-w3)
+      SSIM_W3="$2"
+      shift 2
+      ;;
     --overnight)
       # Already handled above; consume the flag so it isn't treated as unknown.
       shift
@@ -196,6 +236,18 @@ while [[ $# -gt 0 ]]; do
       echo "  --grad-clip-norm NUM Global gradient clipping max-norm (default: 1.0; <=0 disables)"
       echo "  --ema-decay NUM      EMA decay (default: 0.999; <=0 disables)"
       echo "  --ema-update-every N EMA update cadence in optimizer steps (default: 1)"
+      echo "  --kernel-sizes 'K1 K2 ...'"
+      echo "                       Optional odd per-stage kernel schedule forwarded to train.py"
+      echo "                       (example: '7 5 3 3'; default keeps legacy 3x3 kernels)"
+  echo "  --hidden-dims 'C1 C2 ...'"
+      echo "                       Channel widths per encoder stage (default: '32 64 128 256')"
+      echo "                       Length determines U-Net depth (e.g. '16 32 64 128' = shallower)"
+      echo "  --loss-fn NAME       Loss function: mse | mae | huber | ssim (default: huber)"
+      echo "  --huber-delta NUM    Delta for SmoothL1Loss when --loss-fn=huber (default: 1.0)"
+      echo "  --ssim-window-size N Odd cubic SSIM window size for --loss-fn=ssim (default: 7)"
+      echo "  --ssim-w1 NUM        Hybrid SSIM weight for (1-SSIM) term (default: 1.0)"
+      echo "  --ssim-w2 NUM        Hybrid SSIM weight for MSE term (default: 0.0)"
+      echo "  --ssim-w3 NUM        Hybrid SSIM weight for L1 term (default: 0.0)"
       echo "  --overnight           Enable overnight/unattended mode: applies safer thermal defaults"
       echo "                       (max-c 80, cooldown 420s, check every 5 batches, pressure=fair)"
       echo "                       and stability-first optimizer settings. Individual flags override."
@@ -237,7 +289,17 @@ echo "Grad accumulation:  ${GRAD_ACCUM_STEPS}"
 echo "Grad clip norm:     ${GRAD_CLIP_NORM}"
 echo "EMA decay:          ${EMA_DECAY}"
 echo "EMA update every:   ${EMA_UPDATE_EVERY} step(s)"
-echo "Loss/backprop config: loss=MSE(masked target only, fixed); grad_accum_steps=${GRAD_ACCUM_STEPS}; grad_clip_norm=${GRAD_CLIP_NORM}; ema_decay=${EMA_DECAY}; ema_update_every=${EMA_UPDATE_EVERY}"
+if [[ -n "${KERNEL_SIZES}" ]]; then
+echo "Kernel sizes:       ${KERNEL_SIZES}"
+else
+echo "Kernel sizes:       default (legacy 3x3 kernels)"
+fi
+echo "Hidden dims:        ${HIDDEN_DIMS}"
+echo "Loss function:       ${LOSS}$([ "${LOSS}" = "huber" ] && echo " (delta=${HUBER_DELTA})" || true)"
+if [[ "${LOSS}" == "ssim" ]]; then
+echo "SSIM config:         window=${SSIM_WINDOW_SIZE}, w1=${SSIM_W1}, w2=${SSIM_W2}, w3=${SSIM_W3}"
+fi
+echo "Backprop config:     grad_accum_steps=${GRAD_ACCUM_STEPS}; grad_clip_norm=${GRAD_CLIP_NORM}; ema_decay=${EMA_DECAY}; ema_update_every=${EMA_UPDATE_EVERY}"
 [[ -n "${RESUME}" ]] && echo "Resume from: ${RESUME}"
 echo ""
 
@@ -295,6 +357,14 @@ uv run python -u train.py \
     --grad_clip_norm "${GRAD_CLIP_NORM}" \
     --ema_decay "${EMA_DECAY}" \
     --ema_update_every "${EMA_UPDATE_EVERY}" \
+    ${KERNEL_SIZES:+--kernel_sizes ${KERNEL_SIZES}} \
+    --hidden_dims ${HIDDEN_DIMS} \
+    --loss "${LOSS}" \
+    --huber_delta "${HUBER_DELTA}" \
+    --ssim_window_size "${SSIM_WINDOW_SIZE}" \
+    --ssim_w1 "${SSIM_W1}" \
+    --ssim_w2 "${SSIM_W2}" \
+    --ssim_w3 "${SSIM_W3}" \
     ${RESUME:+--resume "${RESUME}"}
 
 echo "=== Multi-dataset training complete ==="
