@@ -60,7 +60,7 @@
 ## Basic Info
 - Relevant commits:
   - Pre-session base: 223ff8b
-  - Session commit: created after summary generation (see `git log -1` after commit).
+  - Session commit: 1fc69b1
 - Files involved in this session scope:
   - src/synthoseis_pre_train/augmentation.py
   - src/synthoseis_pre_train/models.py
