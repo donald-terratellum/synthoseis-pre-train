@@ -35,9 +35,10 @@ from synthoseis_pre_train.gpu_utils import (
     get_cpu_temperature_c,
     get_thermal_pressure_level,
 )
-from synthoseis_pre_train.losses import SSIMHybridLoss3D
+from synthoseis_pre_train.losses import MAESmoothLoss3D, SSIMHybridLoss3D, SlidingWindowStatsLoss3D, SMAELoss
 from synthoseis_pre_train.models import create_model, _MAMBA_AVAILABLE
 from synthoseis_pre_train.plotting import make_4panel_figure, make_crosssection_figure
+from synthoseis_pre_train.models import report_masked_voxel_stats
 
 
 # Defensive runtime scrub: set all Malloc* vars to "0" (explicit disable signal
@@ -324,10 +325,11 @@ def _build_criterion(args) -> nn.Module:
     if loss_fn == "mse":
         return nn.MSELoss()
     if loss_fn == "mae":
-        return nn.L1Loss()
+        return nn.L1Loss() * 2.0 # scale factor to match MSE loss maps (for more intuitive per-voxel contributions)
+    if loss_fn == "mae_smooth":
+        return MAESmoothLoss3D()
     if loss_fn == "huber":
-        delta = float(getattr(args, "huber_delta", 1.0))
-        return nn.SmoothL1Loss(beta=delta)
+        return nn.HuberLoss()
     if loss_fn == "ssim":
         return SSIMHybridLoss3D(
             window_size=int(getattr(args, "ssim_window_size", 7)),
@@ -335,6 +337,20 @@ def _build_criterion(args) -> nn.Module:
             w2=float(getattr(args, "ssim_w2", 0.0)),
             w3=float(getattr(args, "ssim_w3", 0.0)),
         )
+    if loss_fn == "sliding_stats":
+        return SlidingWindowStatsLoss3D(
+            window_size=tuple(int(v) for v in getattr(args, "stats_window_size", [9, 9, 9])),
+            mean_weight=float(getattr(args, "stats_mean_weight", 1.0)),
+            std_weight=float(getattr(args, "stats_std_weight", 1.0)),
+            min_weight=float(getattr(args, "stats_min_weight", 1.0)),
+            max_weight=float(getattr(args, "stats_max_weight", 1.0)),
+            mae_weight=float(getattr(args, "stats_mae_weight", 1.0)),
+            mse_weight=float(getattr(args, "stats_mse_weight", 1.0)),
+            std_ratio_clip=float(getattr(args, "stats_std_ratio_clip", 10.0)),
+            mask_mode=str(getattr(args, "stats_mask_mode", "none")),
+        )
+    if loss_fn == "smae":
+        return SMAELoss()
     raise ValueError(f"Unknown loss function: {loss_fn!r}")
 
 
@@ -384,20 +400,43 @@ def _print_loss_and_backprop_summary(
             f"huber/SmoothL1 (delta={_delta:g}, "
             f"{_src('huber_delta')}, default={defaults['huber_delta']:g})"
         )
+    elif _loss_name == "mae_smooth":
+        _loss_desc = "mae_smooth"
     elif _loss_name == "ssim":
         _loss_desc = "ssim-hybrid"
+    elif _loss_name == "sliding_stats":
+        _loss_desc = "sliding-window-stats"
     else:
         _loss_desc = _loss_name
     _kv("loss", f"{_loss_desc} ({_src('loss')}, default={defaults['loss']})")
+    if _loss_name == "mae_smooth":
+        _kernel = [float(v) for v in getattr(args, "mae_smooth_kernel_weights", [1.0, 2.0, 1.0])]
+        _kernel_str = " ".join(f"{v:g}" for v in _kernel)
+        print(f"{' ':4}{' ':<{label_width}}   - kernel_1d=[{_kernel_str}]")
     if _loss_name == "ssim":
         _ssim_window = int(getattr(args, "ssim_window_size", 7))
         _ssim_w1 = float(getattr(args, "ssim_w1", 1.0))
         _ssim_w2 = float(getattr(args, "ssim_w2", 0.0))
         _ssim_w3 = float(getattr(args, "ssim_w3", 0.0))
-        print(f"{' ':4}{' ':<{label_width}}   - window={_ssim_window},")
+        print(f"{' ':4}{' ':<{label_width}}   - window={_ssim_window},weights: ")
         print(
-            f"{' ':4}{' ':<{label_width}}   - weights: "
+            f"{' ':4}{' ':<{label_width}}     "
             f"(ssim_term={_ssim_w1:g}, mse_term={_ssim_w2:g}, mae_term={_ssim_w3:g})"
+        )
+    if _loss_name == "sliding_stats":
+        _win = [int(v) for v in getattr(args, "stats_window_size", [9, 9, 9])]
+        _mode = str(getattr(args, "stats_mask_mode", "none"))
+        _mw = float(getattr(args, "stats_mean_weight", 1.0))
+        _sw = float(getattr(args, "stats_std_weight", 1.0))
+        _minw = float(getattr(args, "stats_min_weight", 1.0))
+        _maxw = float(getattr(args, "stats_max_weight", 1.0))
+        _maew = float(getattr(args, "stats_mae_weight", 1.0))
+        _msew = float(getattr(args, "stats_mse_weight", 1.0))
+        _clip = float(getattr(args, "stats_std_ratio_clip", 10.0))
+        print(f"{' ':4}{' ':<{label_width}}   - window={tuple(_win)}, mask_mode={_mode}, std_ratio_clip={_clip:g}")
+        print(
+            f"{' ':4}{' ':<{label_width}}     "
+            f"(mean={_mw:g}, std={_sw:g}, min={_minw:g}, max={_maxw:g}, mae={_maew:g}, mse={_msew:g})"
         )
     _kv("AMP", f"{'on' if amp_enabled else 'off'} (auto)")
     _kv(
@@ -825,8 +864,7 @@ def train_epoch(
             # loss = criterion(output[~mask], target[~mask])
             loss = criterion(output, target)  # TODO: switch to masked loss when stable ?
         if batch_idx < 10:
-            masked_output = output[~mask]
-            print(f"          . output[~mask] size: {tuple(masked_output.shape)} | output size: {tuple(output.shape)} | ratio: {masked_output.numel() / output.numel() * 100:.2f} percent")
+            report_masked_voxel_stats(input_data)
         batch_loss = loss.item()
         scaled_loss = loss / accum_steps
 
@@ -896,7 +934,7 @@ def train_epoch(
             elif thermal_guard is not None and thermal_guard.last_pressure_level is not None:
                 temp_str = f", Thermal pressure: {thermal_guard.last_pressure_level}"
             print(
-                f"    Train batch {batch_idx}/{target_batches}, Elapsed DHM: {elapsed_dhm}, "
+                f"    Train batch {batch_idx+1}/{target_batches}, Elapsed DHM: {elapsed_dhm}, "
                 f"Loss: {batch_loss:.4f}, Augmentation non-zero percentage: {avg_pct:.1f}%{temp_str}"
             )
             if output_dir is not None:
@@ -1002,7 +1040,7 @@ def validate(
 
                     with autocast_context(device):
                         output = model(input_data)
-                        loss = criterion(output[~mask], target[~mask])
+                        loss = criterion(output, target)
 
                     if thermal_guard is not None:
                         thermal_guard.sample_temperature(batch_idx)
@@ -1189,11 +1227,19 @@ def main():
         "--loss",
         type=str,
         default="huber",
-        choices=["mse", "mae", "huber", "ssim"],
+        choices=["mse", "mae", "mae_smooth", "huber", "ssim", "sliding_stats", "smae"],
         help=(
-            "Loss function: mse (MSELoss), mae (L1Loss), huber (SmoothL1Loss), "
-            "or ssim (w1*(1-SSIM)+w2*MSE+w3*L1 over 3D volumes) (default: huber)"
+            "Loss function: mse (MSELoss), mae (L1Loss), mae_smooth (smoothed L1), huber (SmoothL1Loss), "
+            "ssim (w1*(1-SSIM)+w2*MSE+w3*L1), sliding_stats (local moments/extrema), or smae (Smooth MAE, e*tanh(e/2), arXiv:2303.09935) "
+            "over 3D volumes (default: huber)"
         ),
+    )
+    parser.add_argument(
+        "--mae_smooth_kernel_weights",
+        type=float,
+        nargs='+',
+        default=[1.0, 2.0, 1.0],
+        help="Odd-length 1D smoothing kernel weights for --loss=mae_smooth (default: 1 2 1)",
     )
     parser.add_argument(
         "--huber_delta",
@@ -1225,6 +1271,28 @@ def main():
         default=0.0,
         help="Weight w3 for L1 term in hybrid SSIM loss (default: 0.0)",
     )
+    parser.add_argument(
+        "--stats_window_size",
+        type=int,
+        nargs=3,
+        default=[9, 9, 9],
+        metavar=("D", "H", "W"),
+        help="Sliding window size for --loss=sliding_stats (default: 9 9 9)",
+    )
+    parser.add_argument(
+        "--stats_mask_mode",
+        type=str,
+        choices=["none", "valid"],
+        default="none",
+        help="Mask behavior for --loss=sliding_stats: none (ignore mask) or valid (use valid mask if provided)",
+    )
+    parser.add_argument("--stats_mean_weight", type=float, default=1.0, help="Weight for local-mean term in sliding_stats")
+    parser.add_argument("--stats_std_weight", type=float, default=1.0, help="Weight for local-std-ratio term in sliding_stats")
+    parser.add_argument("--stats_min_weight", type=float, default=1.0, help="Weight for local-minima term in sliding_stats")
+    parser.add_argument("--stats_max_weight", type=float, default=1.0, help="Weight for local-maxima term in sliding_stats")
+    parser.add_argument("--stats_mae_weight", type=float, default=1.0, help="Weight for voxelwise MAE term in sliding_stats")
+    parser.add_argument("--stats_mse_weight", type=float, default=1.0, help="Weight for voxelwise MSE term in sliding_stats")
+    parser.add_argument("--stats_std_ratio_clip", type=float, default=10.0, help="Clipping bound for local std-ratio in sliding_stats (default: 10.0)")
     parser.add_argument("--ema_decay", type=float, default=0.999,
                        help="EMA decay for model weights; set <=0 to disable")
     parser.add_argument("--ema_update_every", type=int, default=1,
@@ -1267,17 +1335,32 @@ def main():
                        choices=["off", "nominal", "fair", "serious", "critical"],
                        help="Pause on thermal pressure at or above this level (default: serious). Use 'off' to disable pressure-based pausing")
 
+    parser.add_argument(
+        "--deep-reconstruction-head",
+        action="store_true",
+        help="Use a deep reconstruction head (2 Conv3d layers with norm and activation) instead of a single Conv3d layer.",
+    )
     args = parser.parse_args()
     cli_provided = _collect_cli_option_names(sys.argv[1:])
     backprop_defaults = {
         "lr": parser.get_default("lr"),
         "lr_schedule": parser.get_default("lr_schedule"),
         "loss": parser.get_default("loss"),
+        "mae_smooth_kernel_weights": parser.get_default("mae_smooth_kernel_weights"),
         "huber_delta": parser.get_default("huber_delta"),
         "ssim_window_size": parser.get_default("ssim_window_size"),
         "ssim_w1": parser.get_default("ssim_w1"),
         "ssim_w2": parser.get_default("ssim_w2"),
         "ssim_w3": parser.get_default("ssim_w3"),
+        "stats_window_size": parser.get_default("stats_window_size"),
+        "stats_mask_mode": parser.get_default("stats_mask_mode"),
+        "stats_mean_weight": parser.get_default("stats_mean_weight"),
+        "stats_std_weight": parser.get_default("stats_std_weight"),
+        "stats_min_weight": parser.get_default("stats_min_weight"),
+        "stats_max_weight": parser.get_default("stats_max_weight"),
+        "stats_mae_weight": parser.get_default("stats_mae_weight"),
+        "stats_mse_weight": parser.get_default("stats_mse_weight"),
+        "stats_std_ratio_clip": parser.get_default("stats_std_ratio_clip"),
         "grad_accum_steps": parser.get_default("grad_accum_steps"),
         "grad_clip_norm": parser.get_default("grad_clip_norm"),
         "ema_decay": parser.get_default("ema_decay"),
@@ -1310,6 +1393,25 @@ def main():
         )
     if args.loss == "ssim" and (args.ssim_w1 < 0 or args.ssim_w2 < 0 or args.ssim_w3 < 0):
         parser.error("--ssim_w1, --ssim_w2, and --ssim_w3 must be >= 0")
+    if any(int(v) <= 0 for v in args.stats_window_size):
+        parser.error("--stats_window_size entries must be positive integers")
+    if args.stats_std_ratio_clip <= 1.0:
+        parser.error("--stats_std_ratio_clip must be > 1.0")
+    if min(
+        args.stats_mean_weight,
+        args.stats_std_weight,
+        args.stats_min_weight,
+        args.stats_max_weight,
+        args.stats_mae_weight,
+        args.stats_mse_weight,
+    ) < 0:
+        parser.error("--stats_*_weight values must be >= 0")
+    if len(args.mae_smooth_kernel_weights) < 3 or len(args.mae_smooth_kernel_weights) % 2 == 0:
+        parser.error("--mae_smooth_kernel_weights must contain an odd number of values >= 3")
+    if any(v < 0 for v in args.mae_smooth_kernel_weights):
+        parser.error("--mae_smooth_kernel_weights values must be >= 0")
+    if sum(float(v) for v in args.mae_smooth_kernel_weights) <= 0:
+        parser.error("--mae_smooth_kernel_weights must sum to > 0")
 
     if not args.data_paths and not args.data_folder:
         parser.error("At least one of --data_paths or --data_folder must be provided")
@@ -1429,6 +1531,7 @@ def main():
         hidden_dims=tuple(args.hidden_dims),
         kernel_sizes=tuple(args.kernel_sizes) if args.kernel_sizes is not None else None,
         spatial_size=tuple(args.sample_shape),
+        deep_reconstruction_head=args.deep_reconstruction_head,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())

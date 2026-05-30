@@ -60,16 +60,37 @@ EMA_UPDATE_EVERY=${EMA_UPDATE_EVERY:-1}
 KERNEL_SIZES=${KERNEL_SIZES:-""}
 HIDDEN_DIMS=${HIDDEN_DIMS:-"32 64 128 256"}
 LOSS=${LOSS:-"huber"}
+MAE_SMOOTH_KERNEL_WEIGHTS=${MAE_SMOOTH_KERNEL_WEIGHTS:-"1 2 1"}
 HUBER_DELTA=${HUBER_DELTA:-1.0}
 SSIM_WINDOW_SIZE=${SSIM_WINDOW_SIZE:-7}
 SSIM_W1=${SSIM_W1:-1.0}
 SSIM_W2=${SSIM_W2:-0.0}
 SSIM_W3=${SSIM_W3:-0.0}
+STATS_WINDOW_SIZE=${STATS_WINDOW_SIZE:-"9 9 9"}
+STATS_MASK_MODE=${STATS_MASK_MODE:-"none"}
+STATS_MEAN_WEIGHT=${STATS_MEAN_WEIGHT:-1.0}
+STATS_STD_WEIGHT=${STATS_STD_WEIGHT:-1.0}
+STATS_MIN_WEIGHT=${STATS_MIN_WEIGHT:-1.0}
+STATS_MAX_WEIGHT=${STATS_MAX_WEIGHT:-1.0}
+STATS_MAE_WEIGHT=${STATS_MAE_WEIGHT:-1.0}
+STATS_MSE_WEIGHT=${STATS_MSE_WEIGHT:-1.0}
+STATS_STD_RATIO_CLIP=${STATS_STD_RATIO_CLIP:-10.0}
 RESUME=${RESUME:-""}
+
+# Deep reconstruction head flag
+DEEP_RECONSTRUCTION_HEAD=${DEEP_RECONSTRUCTION_HEAD:-0}
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
+      --deep-reconstruction-head)
+        DEEP_RECONSTRUCTION_HEAD=1
+        shift
+        ;;
   case $1 in
+    --smae)
+      LOSS="smae"
+      shift
+      ;;
     --max-epochs)
       MAX_EPOCHS="$2"
       shift 2
@@ -174,6 +195,10 @@ while [[ $# -gt 0 ]]; do
       HUBER_DELTA="$2"
       shift 2
       ;;
+    --mae-smooth-kernel-weights)
+      MAE_SMOOTH_KERNEL_WEIGHTS="$2"
+      shift 2
+      ;;
     --ssim-window-size)
       SSIM_WINDOW_SIZE="$2"
       shift 2
@@ -190,6 +215,42 @@ while [[ $# -gt 0 ]]; do
       SSIM_W3="$2"
       shift 2
       ;;
+    --stats-window-size)
+      STATS_WINDOW_SIZE="$2"
+      shift 2
+      ;;
+    --stats-mask-mode)
+      STATS_MASK_MODE="$2"
+      shift 2
+      ;;
+    --stats-mean-weight)
+      STATS_MEAN_WEIGHT="$2"
+      shift 2
+      ;;
+    --stats-std-weight)
+      STATS_STD_WEIGHT="$2"
+      shift 2
+      ;;
+    --stats-min-weight)
+      STATS_MIN_WEIGHT="$2"
+      shift 2
+      ;;
+    --stats-max-weight)
+      STATS_MAX_WEIGHT="$2"
+      shift 2
+      ;;
+    --stats-mae-weight)
+      STATS_MAE_WEIGHT="$2"
+      shift 2
+      ;;
+    --stats-mse-weight)
+      STATS_MSE_WEIGHT="$2"
+      shift 2
+      ;;
+    --stats-std-ratio-clip)
+      STATS_STD_RATIO_CLIP="$2"
+      shift 2
+      ;;
     --overnight)
       # Already handled above; consume the flag so it isn't treated as unknown.
       shift
@@ -204,6 +265,8 @@ while [[ $# -gt 0 ]]; do
       echo "Train on multiple synthetic seismic datasets"
       echo ""
       echo "Options:"
+      echo "  --deep-reconstruction-head  Use a deep reconstruction head (2 Conv3d layers with norm and activation)"
+      echo "  --smae                    Use SMAE (Symmetric Mean Absolute Error) loss for regression (arXiv:2303.09935)"
       echo "  --max-epochs NUM      Maximum epochs for training (default: 25)"
       echo "  --data-folder PATH    Top-level folder containing datasets (default: /Users/donaldpg/synthoseis/fake_data)"
       echo "  --batch-size NUM|auto Batch size or 'auto' for automatic calculation (default: auto)"
@@ -242,12 +305,28 @@ while [[ $# -gt 0 ]]; do
   echo "  --hidden-dims 'C1 C2 ...'"
       echo "                       Channel widths per encoder stage (default: '32 64 128 256')"
       echo "                       Length determines U-Net depth (e.g. '16 32 64 128' = shallower)"
-      echo "  --loss-fn NAME       Loss function: mse | mae | huber | ssim (default: huber)"
+  echo "  --loss-fn NAME       Loss function: mse | mae | mae_smooth | huber | ssim | sliding_stats | smae (default: huber)"
+  echo "                       smae = Smooth MAE (e*tanh(e/2), arXiv:2303.09935)"
+  echo "  --mae-smooth-kernel-weights 'W1 W2 ...'"
+  echo "                       Odd-length 1D smoothing kernel for --loss-fn=mae_smooth (default: '1 2 1')"
       echo "  --huber-delta NUM    Delta for SmoothL1Loss when --loss-fn=huber (default: 1.0)"
-      echo "  --ssim-window-size N Odd cubic SSIM window size for --loss-fn=ssim (default: 7)"
-      echo "  --ssim-w1 NUM        Hybrid SSIM weight for (1-SSIM) term (default: 1.0)"
-      echo "  --ssim-w2 NUM        Hybrid SSIM weight for MSE term (default: 0.0)"
-      echo "  --ssim-w3 NUM        Hybrid SSIM weight for L1 term (default: 0.0)"
+      echo "  --ssim-window-size N Odd cubic SSIM window edge length when --loss-fn=ssim (default: 7)"
+      echo "  --ssim-w1 NUM        Weight w1 for (1-SSIM) term when --loss-fn=ssim (default: 1.0)"
+      echo "  --ssim-w2 NUM        Weight w2 for MSE term when --loss-fn=ssim (default: 0.0)"
+      echo "  --ssim-w3 NUM        Weight w3 for L1 term when --loss-fn=ssim (default: 0.0)"
+      echo "  --stats-window-size 'D H W'"
+      echo "                       Sliding window size for --loss-fn=sliding_stats (default: '9 9 9')"
+      echo "  --stats-mask-mode MODE"
+      echo "                       Mask behavior for sliding_stats: none|valid (default: none)"
+      echo "  --stats-mean-weight NUM"
+      echo "  --stats-std-weight NUM"
+      echo "  --stats-min-weight NUM"
+      echo "  --stats-max-weight NUM"
+      echo "  --stats-mae-weight NUM"
+      echo "  --stats-mse-weight NUM"
+      echo "                       Sliding_stats component weights (all default: 1.0)"
+      echo "  --stats-std-ratio-clip NUM"
+      echo "                       Std-ratio clipping bound for sliding_stats (default: 10.0)"
       echo "  --overnight           Enable overnight/unattended mode: applies safer thermal defaults"
       echo "                       (max-c 80, cooldown 420s, check every 5 batches, pressure=fair)"
       echo "                       and stability-first optimizer settings. Individual flags override."
@@ -295,9 +374,17 @@ else
 echo "Kernel sizes:       default (legacy 3x3 kernels)"
 fi
 echo "Hidden dims:        ${HIDDEN_DIMS}"
-echo "Loss function:       ${LOSS}$([ "${LOSS}" = "huber" ] && echo " (delta=${HUBER_DELTA})" || true)"
-if [[ "${LOSS}" == "ssim" ]]; then
-echo "SSIM config:         window=${SSIM_WINDOW_SIZE}, w1=${SSIM_W1}, w2=${SSIM_W2}, w3=${SSIM_W3}"
+if [[ "${LOSS}" == "huber" ]]; then
+echo "Loss function:       ${LOSS} (delta=${HUBER_DELTA})"
+elif [[ "${LOSS}" == "mae_smooth" ]]; then
+echo "Loss function:       mae_smooth (kernel_1d=${MAE_SMOOTH_KERNEL_WEIGHTS})"
+elif [[ "${LOSS}" == "ssim" ]]; then
+echo "Loss function:       ssim-hybrid (window=${SSIM_WINDOW_SIZE}, ssim_term=${SSIM_W1}, mse_term=${SSIM_W2}, mae_term=${SSIM_W3})"
+elif [[ "${LOSS}" == "sliding_stats" ]]; then
+echo "Loss function:       sliding_stats (window=${STATS_WINDOW_SIZE}, mask_mode=${STATS_MASK_MODE}, std_ratio_clip=${STATS_STD_RATIO_CLIP})"
+echo "                     weights: mean=${STATS_MEAN_WEIGHT}, std=${STATS_STD_WEIGHT}, min=${STATS_MIN_WEIGHT}, max=${STATS_MAX_WEIGHT}, mae=${STATS_MAE_WEIGHT}, mse=${STATS_MSE_WEIGHT}"
+else
+echo "Loss function:       ${LOSS}"
 fi
 echo "Backprop config:     grad_accum_steps=${GRAD_ACCUM_STEPS}; grad_clip_norm=${GRAD_CLIP_NORM}; ema_decay=${EMA_DECAY}; ema_update_every=${EMA_UPDATE_EVERY}"
 [[ -n "${RESUME}" ]] && echo "Resume from: ${RESUME}"
@@ -360,11 +447,22 @@ uv run python -u train.py \
     ${KERNEL_SIZES:+--kernel_sizes ${KERNEL_SIZES}} \
     --hidden_dims ${HIDDEN_DIMS} \
     --loss "${LOSS}" \
+    --mae_smooth_kernel_weights ${MAE_SMOOTH_KERNEL_WEIGHTS} \
     --huber_delta "${HUBER_DELTA}" \
+    $( [[ "${DEEP_RECONSTRUCTION_HEAD}" == "1" ]] && echo "--deep-reconstruction-head" ) \
     --ssim_window_size "${SSIM_WINDOW_SIZE}" \
     --ssim_w1 "${SSIM_W1}" \
     --ssim_w2 "${SSIM_W2}" \
     --ssim_w3 "${SSIM_W3}" \
+    --stats_window_size ${STATS_WINDOW_SIZE} \
+    --stats_mask_mode "${STATS_MASK_MODE}" \
+    --stats_mean_weight "${STATS_MEAN_WEIGHT}" \
+    --stats_std_weight "${STATS_STD_WEIGHT}" \
+    --stats_min_weight "${STATS_MIN_WEIGHT}" \
+    --stats_max_weight "${STATS_MAX_WEIGHT}" \
+    --stats_mae_weight "${STATS_MAE_WEIGHT}" \
+    --stats_mse_weight "${STATS_MSE_WEIGHT}" \
+    --stats_std_ratio_clip "${STATS_STD_RATIO_CLIP}" \
     ${RESUME:+--resume "${RESUME}"}
 
 echo "=== Multi-dataset training complete ==="

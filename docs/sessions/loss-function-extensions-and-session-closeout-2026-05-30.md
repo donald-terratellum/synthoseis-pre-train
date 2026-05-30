@@ -26,7 +26,7 @@ This session focused on extending the seismic pre-training codebase with new los
   - studies/compare_loss_fn/compare_loss_maps.py
   - studies/find_session_md_files.py
   - docs/sessions/session-summary-and-commit.prompt.md
-- Commits: (to be filled after commit)
+- Commits: d0208204e80f01cd5ae6ca0386c555f5be5dcf01
 
 ## Next and/or Future Follow-up Work Suggestions
 - Add more advanced pseudo-prediction transformations for robustness studies.

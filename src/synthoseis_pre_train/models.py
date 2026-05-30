@@ -293,11 +293,23 @@ class SeismicUNet3d(nn.Module):
         spatial_size: Tuple[int, int, int] = (128, 128, 128),
         use_mamba: bool = False,
         use_checkpoint: bool = True,
+        deep_reconstruction_head: bool = False,
     ):
         super().__init__()
         self.encoder = UNetEncoder3d(input_channels, hidden_dims, kernel_sizes, use_mamba, use_checkpoint)
         self.decoder = UNetDecoder3d(hidden_dims, kernel_sizes, use_checkpoint)
-        self.head = nn.Conv3d(hidden_dims[0], input_channels, kernel_size=1)
+        if deep_reconstruction_head:
+            # Two Conv3d layers with norm and activation between
+            in_ch = hidden_dims[0]
+            mid_ch = max(1, in_ch // 2)
+            self.head = nn.Sequential(
+                nn.Conv3d(in_ch, mid_ch, kernel_size=1),
+                nn.InstanceNorm3d(mid_ch, affine=True),
+                nn.GELU(),
+                nn.Conv3d(mid_ch, input_channels, kernel_size=1),
+            )
+        else:
+            self.head = nn.Conv3d(hidden_dims[0], input_channels, kernel_size=1)
         self._head_type = self.HEAD_RECONSTRUCTION
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -347,6 +359,7 @@ def create_model(
     use_mamba: bool = False,
     use_checkpoint: bool = True,
     kernel_sizes: Tuple[int, ...] | None = None,
+    deep_reconstruction_head: bool = False,
     **kwargs,
 ) -> SeismicUNet3d:
     """
@@ -371,5 +384,69 @@ def create_model(
         use_mamba=use_mamba,
         use_checkpoint=use_checkpoint,
         kernel_sizes=kernel_sizes,
+        deep_reconstruction_head=deep_reconstruction_head,
         **kwargs,
+    )
+
+
+def report_masked_voxel_stats(input: torch.Tensor):
+    """
+    Print detailed masking/extrema/trace stats for a 3D seismic batch.
+    Args:
+        input: (B, C, Z, X, Y) tensor (or (Z, X, Y) if squeezed)
+        extrema_mask: (B, C, Z, X, Y) or (Z, X, Y) or None
+    """
+    # Squeeze batch/channel if present
+    while input.ndim > 3:
+        input = input[0]
+    Z, X, Y = input.shape
+    total_voxels = Z * X * Y
+    # 1. Container (nonzero bounding box)
+    nonzero = (input != 0)
+    nz_idx = nonzero.nonzero(as_tuple=False)
+    if nz_idx.numel() == 0:
+        print(". retained percentages: (container, extrema, clustered) = (0.00%, 0.00%, 0.00%) --> 0.00% retained")
+        return
+    # Find first and last nonzero indices in each dimension (robust, efficient)
+    z_nonzero = (input != 0).any(dim=(1, 2))
+    x_nonzero = (input != 0).any(dim=(0, 2))
+    y_nonzero = (input != 0).any(dim=(0, 1))
+    z_indices = z_nonzero.nonzero(as_tuple=False).squeeze()
+    x_indices = x_nonzero.nonzero(as_tuple=False).squeeze()
+    y_indices = y_nonzero.nonzero(as_tuple=False).squeeze()
+    if z_indices.numel() == 0 or x_indices.numel() == 0 or y_indices.numel() == 0:
+        print(". retained percentages: (container, extrema, clustered) = (0.00%, 0.00%, 0.00%) --> 0.00% retained")
+        return
+    min_z, max_z = z_indices[0].item(), z_indices[-1].item()
+    min_x, max_x = x_indices[0].item(), x_indices[-1].item()
+    min_y, max_y = y_indices[0].item(), y_indices[-1].item()
+    z_valid, x_valid, y_valid = tuple((max_z - min_z + 1, max_x - min_x + 1, max_y - min_y + 1))
+    valid_size = z_valid * x_valid * y_valid
+    container_pct = 100.0 * valid_size / total_voxels
+    # 2. Extrema percent (if provided, using per-trace nonzero count method)
+    extrema_valid = input[min_z:max_z+1, min_x:max_x+1, min_y:max_y+1]
+    # Step 1: count nonzero values along z for each (x, y)
+    extrema_trace_counts = (extrema_valid != 0).sum(dim=0)  # shape (X, Y)
+    # Step 2: count number of traces with any extrema
+    nonzero_traces = (extrema_trace_counts > 0)
+    num_traces = nonzero_traces.sum().item()
+    depth = max_z - min_z + 1
+    denom = num_traces * depth if depth > 0 else 1
+    numer = extrema_trace_counts.sum().item()
+    extrema_pct = 100.0 * numer / denom if denom > 0 else 0.0
+
+    # 3. Clustered traces (fully zeroed traces along Z)
+    # For each (x, y), check if all Z are zero
+    # trace_zero = (output == 0).all(dim=0)  # shape (X, Y)
+    # clustered_count = trace_zero.count_nonzero().item()
+    clustered_pct = 100.0 * num_traces / ((max_x - min_x + 1) * (max_y - min_y + 1))
+    retained_pct = 100.0 * nz_idx.numel() / total_voxels
+    # Print
+    print(
+        f"         . retained percentages: (container shape, container, extrema, clustered) = ("\
+        f"{(z_valid, x_valid, y_valid)}, "\
+        f"{container_pct:.2f}%, "\
+        f"{extrema_pct:.2f}%, "\
+        f"{clustered_pct:.2f}%) --> "\
+        f"{retained_pct:.2f}% retained"
     )
