@@ -13,6 +13,8 @@
   <li>Updated <code>compare_loss_maps.py</code> to include all new adjustments and losses.</li>
   <li>Created a utility script (<code>find_session_md_files.py</code>) to recursively search for session summary markdown files, skipping .venv folders.</li>
   <li>Ensured session closeout instructions are available in <code>docs/sessions/session-summary-and-commit.prompt.md</code>.</li>
+  <li>Updated and refactored <code>src/synthoseis_pre_train/models.py</code> and <code>src/synthoseis_pre_train/plotting.py</code> for improved model and plotting utilities.</li>
+  <li>Enhanced <code>train.py</code> and <code>train_multi_datasets.sh</code> for better CLI integration and training workflow.</li>
 </ul>
 
 <h2>How Was It Done</h2>
@@ -34,12 +36,16 @@
   <li>Key files:
     <ul>
       <li><code>src/synthoseis_pre_train/losses.py</code></li>
+      <li><code>src/synthoseis_pre_train/models.py</code></li>
+      <li><code>src/synthoseis_pre_train/plotting.py</code></li>
       <li><code>studies/compare_loss_fn/compare_loss_maps.py</code></li>
       <li><code>studies/find_session_md_files.py</code></li>
       <li><code>docs/sessions/session-summary-and-commit.prompt.md</code></li>
+      <li><code>train.py</code></li>
+      <li><code>train_multi_datasets.sh</code></li>
     </ul>
   </li>
-  <li>Commits: d0208204e80f01cd5ae6ca0386c555f5be5dcf01</li>
+  <li>Commits: d0208204e80f01cd5ae6ca0386c555f5be5dcf01, 940bc9f2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e</li>
 </ul>
 
 <h2>Next and/or Future Follow-up Work Suggestions</h2>
